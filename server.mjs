@@ -13,6 +13,7 @@ import { createTerminalWebSocketServer, TERMINAL_SOCKET_PATH, websocketOriginAll
 const PORT = Number(process.env.INV_VIEWER_PORT || 4174);
 const CACHE_DIRECTORY = '.inv-cache';
 const THUMBNAIL_DIRECTORY = 'thumbnails';
+const PLAYBACK_DIRECTORY = 'playback';
 const FRAME_METADATA_FILE = '.inv-frames.json';
 const HEADER_BYTES = 8192;
 const MAX_TEXT_BYTES = 5 * 1024 * 1024;
@@ -122,7 +123,7 @@ export function frameTimeRangeFor(durationMs, frameCount, names) {
 }
 function artifactPaths(relativePath) {
   const id = `${stemFor(relativePath)}-${keyFor(relativePath)}`;
-  return { thumbnail: join(cacheRoot(), THUMBNAIL_DIRECTORY, `${id}.thumb.inv.jpg`), frames: join(openedRoot, dirname(relativePath), frameDirectoryName(relativePath)) };
+  return { thumbnail: join(cacheRoot(), THUMBNAIL_DIRECTORY, `${id}.thumb.inv.jpg`), playback: join(cacheRoot(), PLAYBACK_DIRECTORY, `${id}.playback.inv.mp4`), frames: join(openedRoot, dirname(relativePath), frameDirectoryName(relativePath)) };
 }
 async function readManifest() {
   try { return JSON.parse(await fs.readFile(join(cacheRoot(), 'manifest.json'), 'utf8')); } catch { return { version: 1, files: {} }; }
@@ -144,6 +145,11 @@ function updateManifest(update) {
   return task;
 }
 async function fileFingerprint(source) { const info = await fs.stat(source); return { size: info.size, modifiedMs: info.mtimeMs }; }
+function fingerprintMatches(entry, fingerprint) { return entry?.size === fingerprint.size && entry?.modifiedMs === fingerprint.modifiedMs; }
+function updateManifestEntry(manifest, relativePath, fingerprint, values) {
+  const current = manifest.files[relativePath];
+  manifest.files[relativePath] = { ...(fingerprintMatches(current, fingerprint) ? current : {}), ...fingerprint, ...values };
+}
 async function sourceHeader(source) {
   const handle = await fs.open(source, 'r');
   try { const buffer = Buffer.alloc(HEADER_BYTES); const { bytesRead } = await handle.read(buffer, 0, HEADER_BYTES, 0); return buffer.subarray(0, bytesRead); }
@@ -170,6 +176,13 @@ async function isCurrentThumbnail(relativePath, source, manifest) {
   const fingerprint = await fileFingerprint(source);
   if (entry.size !== fingerprint.size || entry.modifiedMs !== fingerprint.modifiedMs) return false;
   try { await fs.access(entry.thumbnail); return true; } catch { return false; }
+}
+async function currentPlaybackPath(relativePath, source, manifest) {
+  const currentManifest = manifest || await readManifest(); const entry = currentManifest.files[relativePath];
+  if (!entry?.playback) return null;
+  const fingerprint = await fileFingerprint(source);
+  if (!fingerprintMatches(entry, fingerprint)) return null;
+  try { await fs.access(entry.playback); return entry.playback; } catch { return null; }
 }
 async function invertFile(source, destination) { await pipeline(createReadStream(source), new Transform({ transform(chunk, _encoding, callback) { callback(null, xor(chunk)); } }), createWriteStream(destination)); }
 async function restoredTemporaryFile(source) {
@@ -212,10 +225,32 @@ async function thumbnailJob(relativePath, source) {
     catch { await runFfmpeg(['-i', restored, '-frames:v', '1', '-q:v', '2', temporaryJpg], job); }
     await invertFile(temporaryJpg, paths.thumbnail);
     const fingerprint = await fileFingerprint(source);
-    await updateManifest((manifest) => { manifest.files[relativePath] = { ...manifest.files[relativePath], ...fingerprint, thumbnail: paths.thumbnail }; });
+    await updateManifest((manifest) => updateManifestEntry(manifest, relativePath, fingerprint, { thumbnail: paths.thumbnail }));
     job.status = 'complete'; job.progress = 1; reportJob(job, true);
   } catch (error) { job.status = 'failed'; job.error = error instanceof Error ? error.message : String(error); reportJob(job, true); }
   finally { await Promise.all([restored, temporaryJpg].filter(Boolean).map((item) => fs.rm(item, { force: true }))); }
+  return job;
+}
+function activePlaybackJob(relativePath) {
+  return [...jobs.values()].find((job) => job.type === 'playback' && job.path === relativePath && (job.status === 'queued' || job.status === 'running')) || null;
+}
+async function playbackJob(job, relativePath, source) {
+  job.status = 'running'; reportJob(job, true); const paths = artifactPaths(relativePath);
+  let restored = null; let encoded = null; let staged = null;
+  try {
+    const initialFingerprint = await fileFingerprint(source);
+    restored = await restoredTemporaryFile(source); job.durationMs = await durationFor(restored); encoded = join(tmpdir(), `inv-viewer-${randomUUID()}.mp4`);
+    await runFfmpeg(['-i', restored, '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', encoded], job);
+    const finalFingerprint = await fileFingerprint(source);
+    if (!fingerprintMatches(initialFingerprint, finalFingerprint)) throw new Error('The source video changed while its compatible copy was being prepared.');
+    await fs.mkdir(dirname(paths.playback), { recursive: true }); staged = `${paths.playback}.${randomUUID()}.tmp`; await invertFile(encoded, staged);
+    const verifiedFingerprint = await fileFingerprint(source);
+    if (!fingerprintMatches(initialFingerprint, verifiedFingerprint)) throw new Error('The source video changed while its compatible copy was being prepared.');
+    await fs.rename(staged, paths.playback); staged = null;
+    await updateManifest((manifest) => updateManifestEntry(manifest, relativePath, initialFingerprint, { playback: paths.playback }));
+    job.status = 'complete'; job.progress = 1; reportJob(job, true);
+  } catch (error) { job.status = 'failed'; job.error = error instanceof Error ? error.message : String(error); reportJob(job, true); }
+  finally { await Promise.all([restored, encoded, staged].filter(Boolean).map((item) => fs.rm(item, { force: true }))); }
   return job;
 }
 async function explodeJob(job, relativePath, source) {
@@ -231,7 +266,7 @@ async function explodeJob(job, relativePath, source) {
     const frameMetadata = { version: 1, sourceName: basename(relativePath), sourceSize: fingerprint.size, sourceModifiedMs: fingerprint.modifiedMs, durationMs, frameCount: generated.length, firstFrameNumber: 1 };
     try { await fs.writeFile(join(staged, FRAME_METADATA_FILE), `${JSON.stringify(frameMetadata, null, 2)}\n`); } catch { /* Timing metadata is optional; keep the extracted frames. */ }
     await fs.mkdir(dirname(paths.frames), { recursive: true }); await fs.rm(paths.frames, { recursive: true, force: true }); await fs.rename(staged, paths.frames);
-    await updateManifest((manifest) => { manifest.files[relativePath] = { ...manifest.files[relativePath], ...fingerprint, frames: paths.frames, frameCount: generated.length, durationMs }; });
+    await updateManifest((manifest) => updateManifestEntry(manifest, relativePath, fingerprint, { frames: paths.frames, frameCount: generated.length, durationMs }));
     job.status = 'complete'; job.progress = 1; reportJob(job, true);
   } catch (error) { job.status = 'failed'; job.error = error instanceof Error ? error.message : String(error); reportJob(job, true); }
   finally { await Promise.all([restored, work, staged].filter(Boolean).map((item) => fs.rm(item, { recursive: true, force: true }))); }
@@ -309,10 +344,15 @@ export function rangeFor(header, size) {
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start >= size || end < start) throw new Error('Requested byte range is not satisfiable.');
   return { start, end: Math.min(end, size - 1) };
 }
-async function serveRestored(request, response, source, mime, filename) { const info = await fs.stat(source); const range = rangeFor(request.headers.range, info.size); const start = range?.start ?? 0; const end = range?.end ?? info.size - 1; const length = end - start + 1; response.writeHead(range ? 206 : 200, { 'content-type': mime, 'content-length': length, 'content-disposition': `inline; filename="${filename.replaceAll('"', '')}"`, 'accept-ranges': 'bytes', ...(range ? { 'content-range': `bytes ${start}-${end}/${info.size}` } : {}), 'cache-control': 'no-store' }); await pipeline(createReadStream(source, { start, end }), new Transform({ transform(chunk, _encoding, callback) { callback(null, xor(chunk)); } }), response); }
-const server = createServer(async (request, response) => {
-  try {
-    const url = new URL(request.url || '/', `http://${request.headers.host || '127.0.0.1'}`); const path = url.pathname;
+function isClientDisconnect(error, request) { return request.aborted || error?.code === 'ERR_STREAM_PREMATURE_CLOSE' || error?.code === 'ECONNRESET'; }
+async function serveRestored(request, response, source, mime, filename) {
+  const info = await fs.stat(source); const range = rangeFor(request.headers.range, info.size); const start = range?.start ?? 0; const end = range?.end ?? info.size - 1; const length = end - start + 1;
+  response.writeHead(range ? 206 : 200, { 'content-type': mime, 'content-length': length, 'content-disposition': `inline; filename="${filename.replaceAll('"', '')}"`, 'accept-ranges': 'bytes', ...(range ? { 'content-range': `bytes ${start}-${end}/${info.size}` } : {}), 'cache-control': 'no-store' });
+  try { await pipeline(createReadStream(source, { start, end }), new Transform({ transform(chunk, _encoding, callback) { callback(null, xor(chunk)); } }), response); }
+  catch (error) { if (!isClientDisconnect(error, request)) throw error; }
+}
+async function handleRequest(request, response) {
+  const url = new URL(request.url || '/', `http://${request.headers.host || '127.0.0.1'}`); const path = url.pathname;
     if (request.method === 'POST' && path === '/api/open') { const body = await readJson(request); const candidate = resolve(String(body.path || '')); const info = await fs.stat(candidate); if (!info.isDirectory()) throw new Error('The supplied path is not a directory.'); openedRoot = candidate; const catalog = await scanFolder('', { includeHidden: Boolean(body.showHidden), query: String(body.query || '').toLowerCase(), filter: String(body.filter || 'all') }); return sendJson(response, 200, { root: openedRoot, directory: '', parentListable: await hasListableParent(openedRoot), ...catalog }); }
     if (request.method === 'GET' && path === '/api/catalog') { const directory = url.searchParams.get('path') || ''; const current = await resolveDirectory(directory); const catalog = await scanFolder(directory, { includeHidden: url.searchParams.get('hidden') === '1', query: (url.searchParams.get('query') || '').toLowerCase(), filter: url.searchParams.get('filter') || 'all', offset: Math.max(0, Number(url.searchParams.get('offset') || 0) || 0), limit: 250 }); return sendJson(response, 200, { root: openedRoot, directory, parentListable: await hasListableParent(current), ...catalog }); }
     if (request.method === 'GET' && path === '/api/jobs') return sendJson(response, 200, [...jobs.values()]);
@@ -320,13 +360,21 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && path === '/api/files/move') { const body = await readJson(request); await moveEntries(body.paths, body.destination); return sendJson(response, 200, { ok: true }); }
     if (request.method === 'DELETE' && path === '/api/files') { const body = await readJson(request); await deleteEntries(body.paths); return sendJson(response, 200, { ok: true }); }
     if (request.method === 'POST' && path === '/api/videos/explode') { const body = await readJson(request); const source = resolveSource(body.path); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be exploded.'); const job = createJob('frames', body.path); void explodeJob(job, body.path, source); return sendJson(response, 202, job); }
+    if (request.method === 'POST' && path === '/api/videos/playback') { const body = await readJson(request); const relativePath = String(body.path || ''); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be prepared for playback.'); if (await currentPlaybackPath(relativePath, source)) return sendJson(response, 200, { status: 'ready', url: `/api/videos/playback?path=${encodeURIComponent(relativePath)}` }); const active = activePlaybackJob(relativePath); if (active) return sendJson(response, 202, { status: 'preparing', job: active }); const job = createJob('playback', relativePath); void playbackJob(job, relativePath, source); return sendJson(response, 202, { status: 'preparing', job }); }
+    if (request.method === 'GET' && path === '/api/videos/playback') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const playback = await currentPlaybackPath(relativePath, source); if (!playback) throw new Error('A compatible playback copy is not ready.'); const sourceName = restoredName(basename(relativePath)); const filename = `${basename(sourceName, extname(sourceName)) || 'video'}.mp4`; return serveRestored(request, response, playback, 'video/mp4', filename); }
     if (request.method === 'GET' && path === '/api/media') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); return serveRestored(request, response, source, mime, restoredName(basename(source))); }
     if (request.method === 'GET' && path === '/api/thumbnail') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const manifest = await readManifest(); const thumbnail = manifest.files[relativePath]?.thumbnail; if (!thumbnail) throw new Error('Thumbnail is not ready.'); return serveRestored(request, response, thumbnail, 'image/jpeg', basename(thumbnail)); }
     if (request.method === 'GET' && path === '/api/text') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); if (!textMimeFor(basename(source)) || !isConventionalInvertedName(basename(source))) throw new Error('Only supported inverted text files can be edited.'); const info = await fs.stat(source); return sendJson(response, 200, { content: await restoredText(source), size: info.size, modified: info.mtimeMs }); }
     if (request.method === 'PUT' && path === '/api/text') { const body = await readJson(request); const source = resolveSource(body.path); if (!textMimeFor(basename(source)) || !isConventionalInvertedName(basename(source))) throw new Error('Only supported inverted text files can be edited.'); await saveRestoredText(source, body.content); const info = await fs.stat(source); return sendJson(response, 200, { size: info.size, modified: info.mtimeMs }); }
     if (request.method === 'GET' && !path.startsWith('/api/')) return serveApplication(response, path);
     sendJson(response, 404, { error: 'Not found.' });
-  } catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
+}
+export const server = createServer((request, response) => {
+  void handleRequest(request, response).catch((error) => {
+    if (isClientDisconnect(error, request)) return;
+    if (response.headersSent) { response.destroy(error); return; }
+    sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+  });
 });
 const liveWebSockets = new WebSocketServer({ noServer: true });
 const terminalWebSockets = createTerminalWebSocketServer();

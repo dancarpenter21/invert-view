@@ -5,17 +5,19 @@ It determines an inverted file's restored MIME type from its file signature,
 hides recognizable files that are already uninverted, then streams restored
 images and videos to the browser without uploading them. Video playback uses
 seekable byte-range streaming, so restored files do not need to fit in memory.
-Video previews start muted; opening a video uses the full player with its
+Video previews and full players start muted; the full player retains its
 original audio and complete seekable duration when the browser supports the
-source container and codecs.
+source container and codecs. Legacy formats such as AVI/DivX are converted on
+demand to a seekable H.264/AAC MP4 without changing the source file.
 
 ## Requirements
 
 - Node.js 20.19+ or 22.12+ (Node 24 is supported)
 - `zsh` at `/usr/bin/zsh` for the integrated terminal. Installing dependencies
   also requires the standard native Node build toolchain for `node-pty`.
-- `ffmpeg` on `PATH` for video thumbnails and frame extraction. `ffprobe` is
-  optional and is used only to make frame-job progress more accurate.
+- `ffmpeg` on `PATH` for video thumbnails, frame extraction, and compatibility
+  playback. Its build must include the `libx264` video encoder and AAC audio
+  encoder. `ffprobe` is optional and is used to make job progress more accurate.
 
 ## Run locally
 
@@ -88,6 +90,14 @@ opened folder's `.inv-cache/thumbnails/` directory. The thumbnail itself is an
 inverted JPEG ending in `.inv.jpg`; no plain thumbnail is retained. Cache
 metadata in `.inv-cache/manifest.json` records the source size and modification
 time, so a thumbnail is regenerated only when its source changes.
+
+Opening a legacy video in the full viewer starts one background compatibility
+job. Its browser-compatible MP4 is stored inverted under `.inv-cache/playback/`
+and reused until the source size or modification time changes. The viewer shows
+conversion progress, and the job continues if you return to the catalog. Plain
+restored and transcoded intermediates exist only in the operating system's
+temporary directory and are removed when the job finishes or fails. Restore &
+download always returns the original restored format, not the cached derivative.
 
 Right-click a video card and choose **Explode into frames** to export every
 decoded frame. Inverted JPEGs are placed beside the source video in a visible

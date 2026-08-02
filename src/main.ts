@@ -7,7 +7,8 @@ type ViewMode = 'detailed' | 'small' | 'medium' | 'large';
 type CatalogFile = { path: string; name: string; size: number; modified: number; mime: string; kind: Exclude<Filter, 'all'>; editableText?: boolean; thumbnail: string | 'pending' | null };
 type DirectoryEntry = { path: string; name: string; directory: true };
 type CatalogEntry = CatalogFile | DirectoryEntry;
-type Job = { id: string; type: 'thumbnail' | 'frames'; path: string; status: 'queued' | 'running' | 'complete' | 'failed'; progress: number; error: string | null; createdAt: number };
+type Job = { id: string; type: 'thumbnail' | 'frames' | 'playback'; path: string; status: 'queued' | 'running' | 'complete' | 'failed'; progress: number; error: string | null; createdAt: number };
+type PlaybackResponse = { status: 'ready'; url: string } | { status: 'preparing'; job: Job };
 type FrameTimeRange = { sourceName: string; startMs: number; endMs: number };
 type LiveServerMessage = { type: 'snapshot'; jobs: Job[] } | { type: 'job'; job: Job } | { type: 'watch-ready' | 'catalog-change'; root: string; directory: string } | { type: 'watch-error'; root: string; directory: string; error: string };
 
@@ -17,6 +18,7 @@ const state = { files: [] as CatalogEntry[], selected: null as CatalogFile | nul
 const urlFor = (route: string) => route;
 const restoredName = (name: string) => name.replace(/\.inv(?=\.[^.]+$|$)/i, '');
 const mediaUrl = (file: CatalogFile) => urlFor(`/api/media?path=${encodeURIComponent(file.path)}`);
+const playbackUrl = (file: CatalogFile) => urlFor(`/api/videos/playback?path=${encodeURIComponent(file.path)}`);
 const formatSize = (bytes: number) => bytes < 1024 ** 2 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 ** 2).toFixed(bytes > 100 * 1024 ** 2 ? 0 : 1)} MB`;
 const formatModified = (modified: number) => new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' }).format(modified);
 const formatVideoTime = (milliseconds: number) => { const totalSeconds = Math.max(0, Math.round(milliseconds / 1000)); const hours = Math.floor(totalSeconds / 3600); const minutes = Math.floor(totalSeconds % 3600 / 60); const seconds = totalSeconds % 60; return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}` : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`; };
@@ -64,25 +66,25 @@ async function copyCurrentPath(): Promise<void> {
   } catch { toast('Could not copy the path.'); }
 }
 function stopPreviewVideo(): void { const video = find<HTMLElement>('#preview-pane').querySelector<HTMLVideoElement>('#preview-media video'); if (!video) return; video.pause(); video.removeAttribute('src'); video.load(); }
-const terminalFrameJobsShown = new Set<string>(); let jobUpdatesInitialized = false; let jobStatusTimer: number | undefined;
-function renderFrameJobStatus(): void {
-  const element = find<HTMLDivElement>('#job-status'); const frameJobs = state.jobs.filter((job) => job.type === 'frames').sort((left, right) => left.createdAt - right.createdAt); const active = [...frameJobs].reverse().find((job) => job.status === 'queued' || job.status === 'running');
-  let job = active || frameJobs.at(-1); if (!job) { element.hidden = true; return; }
-  if (!active && terminalFrameJobsShown.has(job.id)) return;
-  window.clearTimeout(jobStatusTimer); if (!active) terminalFrameJobsShown.add(job.id);
-  const percent = Math.max(0, Math.min(100, Math.round(job.progress * 100))); const name = restoredName(job.path.split('/').at(-1) || job.path); const title = job.status === 'complete' ? 'Frame extraction complete' : job.status === 'failed' ? 'Frame extraction failed' : 'Extracting frames';
-  const detail = job.status === 'failed' ? job.error || 'The extraction job failed.' : job.status === 'complete' ? 'Frames are ready.' : job.status === 'queued' ? 'Preparing…' : job.progress > 0 ? `${percent}% complete` : 'Extracting…';
+const terminalJobsShown = new Set<string>(); let jobUpdatesInitialized = false; let jobStatusTimer: number | undefined;
+function renderJobStatus(): void {
+  const element = find<HTMLDivElement>('#job-status'); const visibleJobs = state.jobs.filter((job) => job.type === 'frames' || job.type === 'playback').sort((left, right) => left.createdAt - right.createdAt); const active = [...visibleJobs].reverse().find((job) => job.status === 'queued' || job.status === 'running');
+  let job = active || visibleJobs.at(-1); if (!job) { element.hidden = true; return; }
+  if (!active && terminalJobsShown.has(job.id)) return;
+  window.clearTimeout(jobStatusTimer); if (!active) terminalJobsShown.add(job.id);
+  const percent = Math.max(0, Math.min(100, Math.round(job.progress * 100))); const name = restoredName(job.path.split('/').at(-1) || job.path); const playback = job.type === 'playback'; const title = job.status === 'complete' ? playback ? 'Video ready' : 'Frame extraction complete' : job.status === 'failed' ? playback ? 'Video preparation failed' : 'Frame extraction failed' : playback ? 'Preparing video' : 'Extracting frames';
+  const detail = job.status === 'failed' ? job.error || (playback ? 'The compatible video could not be created.' : 'The extraction job failed.') : job.status === 'complete' ? playback ? 'Compatible playback is ready.' : 'Frames are ready.' : job.status === 'queued' ? 'Preparing…' : job.progress > 0 ? `${percent}% complete` : playback ? 'Converting…' : 'Extracting…';
   const indeterminate = job.status === 'queued' || (job.status === 'running' && job.progress === 0); element.className = `job-status job-${job.status}`; element.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(name)}</span><p>${escapeHtml(detail)}</p><div class="job-progress${indeterminate ? ' indeterminate' : ''}"><i style="width:${percent}%"></i></div>`; element.hidden = false;
   if (!active) jobStatusTimer = window.setTimeout(() => { element.hidden = true; }, 5_000);
 }
 function applyJobUpdate(job: Job): void {
-  const previous = state.jobs.find((item) => item.id === job.id); state.jobs = [...state.jobs.filter((item) => item.id !== job.id), job]; renderFrameJobStatus();
+  const previous = state.jobs.find((item) => item.id === job.id); state.jobs = [...state.jobs.filter((item) => item.id !== job.id), job]; renderJobStatus(); updatePlaybackViewer(job);
   if (job.status === 'failed' && job.type === 'thumbnail' && previous?.status !== 'failed') toast(`Thumbnail creation failed: ${job.error}`);
-  if (job.status === 'complete' && previous?.status !== 'complete') void refreshCatalog();
+  if (job.status === 'complete' && job.type !== 'playback' && previous?.status !== 'complete') void refreshCatalog();
 }
 function applyJobSnapshot(jobs: Job[]): void {
-  const previous = new Map(state.jobs.map((job) => [job.id, job])); if (!jobUpdatesInitialized) jobs.filter((job) => job.type === 'frames' && (job.status === 'complete' || job.status === 'failed')).forEach((job) => terminalFrameJobsShown.add(job.id));
-  state.jobs = jobs; jobUpdatesInitialized = true; renderFrameJobStatus();
+  const previous = new Map(state.jobs.map((job) => [job.id, job])); if (!jobUpdatesInitialized) jobs.filter((job) => (job.type === 'frames' || job.type === 'playback') && (job.status === 'complete' || job.status === 'failed')).forEach((job) => terminalJobsShown.add(job.id));
+  state.jobs = jobs; jobUpdatesInitialized = true; renderJobStatus(); jobs.filter((job) => job.type === 'playback').forEach(updatePlaybackViewer);
   const failedThumbnail = jobs.find((job) => job.type === 'thumbnail' && job.status === 'failed' && previous.get(job.id)?.status !== 'failed'); if (failedThumbnail && previous.size) toast(`Thumbnail creation failed: ${failedThumbnail.error}`);
   if (jobs.some((job) => job.status === 'complete' && previous.get(job.id)?.status !== 'complete')) void refreshCatalog();
 }
@@ -139,6 +141,7 @@ function showPreview(file: CatalogFile): void {
   stopPreviewVideo(); state.selected = file; const empty = find<HTMLElement>('#preview-empty'); const content = find<HTMLElement>('#preview-content'); empty.hidden = true; content.hidden = false; content.innerHTML = `<h2>${escapeHtml(restoredName(file.name))}</h2><p>${escapeHtml(file.mime)} · ${formatSize(file.size)}</p><div class="preview-media" id="preview-media"></div><button class="back-button" id="open-preview">Open file</button>`; find('#open-preview').addEventListener('click', () => void openViewer(file)); const media = find<HTMLElement>('#preview-media');
   if (file.thumbnail && file.thumbnail !== 'pending') { const image = new Image(); image.src = urlFor(file.thumbnail); image.alt = `Preview of ${restoredName(file.name)}`; media.append(image); }
   else if (file.kind === 'images') { const image = new Image(); image.src = mediaUrl(file); image.alt = `Restored preview of ${restoredName(file.name)}`; media.append(image); }
+  else if (file.kind === 'videos' && file.mime === 'video/x-msvideo') { media.innerHTML = '<p class="preview-note">Open this video to prepare a browser-compatible copy.</p>'; }
   else if (file.kind === 'videos') { const video = document.createElement('video'); video.src = mediaUrl(file); video.controls = true; video.muted = true; video.preload = 'metadata'; video.setAttribute('aria-label', `Muted preview of ${restoredName(file.name)}`); media.append(video); }
   else { media.innerHTML = '<span class="file-glyph large">TXT</span>'; }
 }
@@ -151,12 +154,41 @@ function selectEntry(entry: CatalogEntry, event: MouseEvent): void {
   renderCatalog();
 }
 
+function renderPreparedVideo(file: CatalogFile): void {
+  if (state.screen !== 'viewer' || state.selected?.path !== file.path) return;
+  const media = find<HTMLElement>('#viewer-media'); media.innerHTML = ''; const video = document.createElement('video'); video.src = playbackUrl(file); video.controls = true; video.muted = true; video.defaultMuted = true; video.preload = 'metadata'; video.className = 'viewer-video'; video.setAttribute('aria-label', `Compatible player for ${restoredName(file.name)}`); video.addEventListener('error', () => { if (state.selected?.path === file.path) media.innerHTML = '<p class="viewer-error">The compatible video could not be loaded. You can still restore and download the original file.</p>'; }); media.append(video);
+}
+function renderPlaybackJob(file: CatalogFile, job: Job): void {
+  if (state.screen !== 'viewer' || state.selected?.path !== file.path) return;
+  if (job.status === 'complete') return renderPreparedVideo(file);
+  const media = find<HTMLElement>('#viewer-media'); const percent = Math.max(0, Math.min(100, Math.round(job.progress * 100)));
+  if (job.status === 'failed') { media.innerHTML = `<div class="playback-preparing playback-failed"><h2>Video preparation failed</h2><p>${escapeHtml(job.error || 'A browser-compatible copy could not be created.')}</p><p>You can still restore and download the original file.</p><button class="back-button" id="retry-playback" type="button">Try again</button></div>`; find('#retry-playback').addEventListener('click', () => void preparePlayback(file)); return; }
+  const detail = job.status === 'queued' || job.progress === 0 ? 'Starting FFmpeg…' : `${percent}% complete`;
+  media.innerHTML = `<div class="playback-preparing"><h2>Preparing video for browser playback</h2><p>${escapeHtml(detail)}</p><div class="job-progress${job.progress === 0 ? ' indeterminate' : ''}"><i style="width:${percent}%"></i></div><span>The original file is unchanged. You may leave this viewer while conversion continues.</span></div>`;
+}
+function updatePlaybackViewer(job: Job): void {
+  if (job.type !== 'playback' || state.screen !== 'viewer' || state.selected?.path !== job.path || state.selected.kind !== 'videos') return;
+  renderPlaybackJob(state.selected, job);
+}
+async function preparePlayback(file: CatalogFile): Promise<void> {
+  if (state.screen !== 'viewer' || state.selected?.path !== file.path) return;
+  const media = find<HTMLElement>('#viewer-media'); media.innerHTML = '<div class="playback-preparing"><h2>Preparing video for browser playback</h2><p>Checking the local cache…</p><div class="job-progress indeterminate"><i></i></div></div>';
+  try {
+    const result = await api<PlaybackResponse>('/api/videos/playback', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: file.path }) });
+    if (state.screen !== 'viewer' || state.selected?.path !== file.path) return;
+    if (result.status === 'ready') renderPreparedVideo(file); else { applyJobUpdate(result.job); renderPlaybackJob(file, result.job); }
+  } catch (error) { if (state.screen === 'viewer' && state.selected?.path === file.path) media.innerHTML = `<p class="viewer-error">${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`; }
+}
+function renderNativeVideo(file: CatalogFile): void {
+  const media = find<HTMLElement>('#viewer-media'); const video = document.createElement('video'); let fallingBack = false; video.src = mediaUrl(file); video.controls = true; video.muted = true; video.defaultMuted = true; video.preload = 'metadata'; video.className = 'viewer-video'; video.setAttribute('aria-label', `Full player for ${restoredName(file.name)}`); video.addEventListener('error', () => { if (fallingBack || state.selected?.path !== file.path) return; fallingBack = true; video.removeAttribute('src'); video.load(); void preparePlayback(file); }); media.append(video);
+}
 async function openViewer(file: CatalogFile): Promise<void> {
   stopPreviewVideo(); find<HTMLElement>('.app-shell').classList.remove('preview-visible'); state.selected = file; state.screen = 'viewer'; state.textDirty = false; find('#catalog-view').setAttribute('hidden', ''); find('#viewer').removeAttribute('hidden'); find('#search-wrap').setAttribute('hidden', ''); find('#location-name').textContent = restoredName(file.name); const viewer = find<HTMLElement>('#viewer'); viewer.innerHTML = `<div class="viewer-head"><button class="back-button" id="back-button">← Back to files</button><div><h1>${escapeHtml(restoredName(file.name))}</h1><p>${escapeHtml(file.mime)} · ${formatSize(file.size)} · ${formatModified(file.modified)}</p></div><button class="restore-button viewer-download" id="restore-button">Restore &amp; download <span>↓</span></button></div><div class="viewer-media" id="viewer-media"></div>`;
   find('#back-button').addEventListener('click', closeViewer); find('#restore-button').addEventListener('click', () => void downloadSelected()); const media = find<HTMLElement>('#viewer-media');
   if (file.editableText) { media.innerHTML = `<div class="text-editor-head"><span id="text-status">Loading text…</span><button class="restore-button" id="save-text" disabled>Save</button></div><textarea id="text-editor" spellcheck="false" aria-label="Editable restored text"></textarea>`; try { const result = await api<{ content: string }>('/api/text?path=' + encodeURIComponent(file.path)); if (state.selected?.path !== file.path) return; const editor = find<HTMLTextAreaElement>('#text-editor'); editor.value = result.content; find<HTMLButtonElement>('#save-text').disabled = false; find('#text-status').textContent = 'Editing restored UTF-8 text'; editor.addEventListener('input', () => { state.textDirty = true; find('#text-status').textContent = 'Unsaved changes'; }); find('#save-text').addEventListener('click', () => void saveText(file, editor)); } catch (error) { media.innerHTML = `<p class="viewer-error">${error instanceof Error ? error.message : String(error)}</p>`; } }
   else if (file.kind === 'images') { const image = new Image(); image.src = mediaUrl(file); image.alt = `Restored preview of ${restoredName(file.name)}`; image.className = 'viewer-image'; media.append(image); }
-  else if (file.kind === 'videos') { const video = document.createElement('video'); video.src = mediaUrl(file); video.controls = true; video.muted = false; video.preload = 'metadata'; video.className = 'viewer-video'; video.setAttribute('aria-label', `Full player for ${restoredName(file.name)}`); video.addEventListener('error', () => toast('Browser playback is unavailable for this video format.')); media.append(video); }
+  else if (file.kind === 'videos' && file.mime === 'video/x-msvideo') void preparePlayback(file);
+  else if (file.kind === 'videos') renderNativeVideo(file);
   else media.innerHTML = '<p class="viewer-error">This restored file cannot be previewed.</p>';
 }
 function closeViewer(): void { const refreshNeeded = state.catalogDirty; state.catalogDirty = false; state.screen = 'catalog'; state.selected = null; find('#viewer').setAttribute('hidden', ''); find('#catalog-view').removeAttribute('hidden'); find('#search-wrap').removeAttribute('hidden'); find('#location-name').textContent = state.directory || 'Root'; renderCatalog(); if (refreshNeeded) scheduleCatalogRefresh(0); }

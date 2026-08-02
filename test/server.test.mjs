@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { promises as fs } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, isConventionalInvertedName, isInvertedMedia, isWatchableChange, rangeFor, restoredName, restoredText, saveRestoredText, textMimeFor, validateFolderName, watchDirectoryChanges, xor } from '../server.mjs';
+import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, isConventionalInvertedName, isInvertedMedia, isWatchableChange, rangeFor, restoredName, restoredText, saveRestoredText, server, textMimeFor, validateFolderName, watchDirectoryChanges, xor } from '../server.mjs';
 
 async function waitFor(check, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -42,6 +45,34 @@ test('media byte ranges select only the requested restored bytes', () => {
   assert.deepEqual(rangeFor('bytes=-3', 10), { start: 7, end: 9 });
   assert.equal(rangeFor(undefined, 10), null);
   assert.throws(() => rangeFor('bytes=10-12', 10), /not satisfiable/);
+});
+
+test('aborted media streams stay available and legacy video gains cached compatible playback', { timeout: 30_000 }, async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-playback-')); const plain = join(directory, 'clip.avi'); const source = join(directory, 'clip.inv.avi'); const prepared = join(directory, 'prepared.mp4');
+  try {
+    const generated = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=64x48:rate=10', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '1', '-c:v', 'mpeg4', '-c:a', 'mp3', plain]);
+    assert.equal(generated.status, 0, generated.stderr?.toString());
+    const restored = Buffer.concat([await fs.readFile(plain), Buffer.alloc(8 * 1024 * 1024)]); await fs.writeFile(source, xor(restored)); await fs.rm(plain);
+    server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); assert(address && typeof address === 'object'); const base = `http://127.0.0.1:${address.port}`;
+    const opened = await fetch(`${base}/api/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: directory }) }); assert.equal(opened.status, 200);
+    await new Promise((resolveAbort, rejectAbort) => { const request = httpRequest(`${base}/api/media?path=${encodeURIComponent('clip.inv.avi')}`, (response) => { response.once('data', () => { response.destroy(); resolveAbort(); }); }); request.once('error', rejectAbort); request.end(); });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 30)); assert.equal((await fetch(`${base}/api/jobs`)).status, 200);
+    const begin = await fetch(`${base}/api/videos/playback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi' }) }); const first = await begin.json(); assert.equal(begin.status, 202); assert.equal(first.status, 'preparing'); assert.equal(first.job.type, 'playback');
+    const duplicateResponse = await fetch(`${base}/api/videos/playback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi' }) }); const duplicate = await duplicateResponse.json(); assert.equal(duplicate.status, 'preparing'); assert.equal(duplicate.job.id, first.job.id);
+    let playbackJob;
+    async function refreshPlaybackJob() { const snapshot = await (await fetch(`${base}/api/jobs`)).json(); playbackJob = snapshot.find((job) => job.id === first.job.id); }
+    const deadline = Date.now() + 20_000; while (!playbackJob || (playbackJob.status !== 'complete' && playbackJob.status !== 'failed')) { if (Date.now() >= deadline) throw new Error(`Timed out waiting for playback preparation: ${playbackJob?.error || 'no job result'}`); await refreshPlaybackJob(); if (playbackJob?.status === 'complete' || playbackJob?.status === 'failed') break; await new Promise((resolveWait) => setTimeout(resolveWait, 25)); }
+    assert.equal(playbackJob.status, 'complete', playbackJob.error);
+    const ready = await fetch(`${base}/api/videos/playback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi' }) }); assert.equal(ready.status, 200); assert.equal((await ready.json()).status, 'ready');
+    const range = await fetch(`${base}/api/videos/playback?path=${encodeURIComponent('clip.inv.avi')}`, { headers: { range: 'bytes=0-31' } }); const rangeBytes = Buffer.from(await range.arrayBuffer()); assert.equal(range.status, 206); assert.equal(range.headers.get('content-type'), 'video/mp4'); assert.equal(rangeBytes.length, 32); assert.equal(rangeBytes.subarray(4, 8).toString('ascii'), 'ftyp');
+    const complete = await fetch(`${base}/api/videos/playback?path=${encodeURIComponent('clip.inv.avi')}`); await fs.writeFile(prepared, Buffer.from(await complete.arrayBuffer())); const probed = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name,codec_type', '-of', 'json', prepared]); assert.equal(probed.status, 0, probed.stderr?.toString()); const streams = JSON.parse(probed.stdout.toString()).streams; assert(streams.some((stream) => stream.codec_type === 'video' && stream.codec_name === 'h264')); assert(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
+    const manifest = JSON.parse(await fs.readFile(join(directory, '.inv-cache', 'manifest.json'), 'utf8')); const cached = await fs.readFile(manifest.files['clip.inv.avi'].playback); assert.equal(detectMime(cached), 'application/octet-stream'); assert.equal(detectMime(xor(cached.subarray(0, 32))), 'video/mp4');
+    const sourceInfo = await fs.stat(source); await fs.utimes(source, sourceInfo.atime, new Date(sourceInfo.mtimeMs + 2_000)); const invalidated = await fetch(`${base}/api/videos/playback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi' }) }); const replacement = await invalidated.json(); assert.equal(invalidated.status, 202); assert.notEqual(replacement.job.id, first.job.id);
+    const replacementDeadline = Date.now() + 20_000; let replacementJob; while (!replacementJob || (replacementJob.status !== 'complete' && replacementJob.status !== 'failed')) { if (Date.now() >= replacementDeadline) throw new Error(`Timed out waiting for replacement playback preparation: ${replacementJob?.error || 'no job result'}`); const snapshot = await (await fetch(`${base}/api/jobs`)).json(); replacementJob = snapshot.find((job) => job.id === replacement.job.id); await new Promise((resolveWait) => setTimeout(resolveWait, 25)); } assert.equal(replacementJob.status, 'complete', replacementJob.error);
+  } finally {
+    if (server.listening) await new Promise((resolveClose) => server.close(resolveClose));
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('conventional inverted text files are identified without exposing plain text files', () => {
