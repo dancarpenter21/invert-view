@@ -12,11 +12,18 @@
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "node-pty": "^1.1.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.8.3",
     "vite": "^7.0.0"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true,
+    "esbuild@0.28.1": true
   }
 }

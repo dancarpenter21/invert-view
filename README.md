@@ -12,6 +12,8 @@ source container and codecs.
 ## Requirements
 
 - Node.js 20.19+ or 22.12+ (Node 24 is supported)
+- `zsh` at `/usr/bin/zsh` for the integrated terminal. Installing dependencies
+  also requires the standard native Node build toolchain for `node-pty`.
 - `ffmpeg` on `PATH` for video thumbnails and frame extraction. `ffprobe` is
   optional and is used only to make frame-job progress more accurate.
 
@@ -30,6 +32,22 @@ The development launch sets
 `VITE_DEFAULT_FOLDER` to `/home/danc/.diadev/docs`; set
 `INV_VIEWER_DEFAULT_FOLDER` before launching to choose another initial folder.
 Production starts with no folder open.
+
+## Integrated terminal
+
+The bottom dock runs a real interactive zsh session on the same machine and
+with the same user permissions as the server. It is intended only for this
+loopback-only local application; commands entered in the browser can read,
+change, or delete anything that user can access.
+
+A new shell starts in the folder currently displayed by the file browser. The
+shell and browser then navigate independently so changing folders does not
+interrupt a running command. Use **New shell here** to end the current shell
+and deliberately restart in the browser's displayed folder. The terminal can
+be collapsed or resized from its top edge, and both preferences are remembered
+by the browser. Collapsing keeps the shell alive; refreshing or closing the tab
+ends it. Zsh history, control keys, ANSI applications, and configured tab
+completion are available through the pseudo-terminal.
 
 Large directories are loaded in pages of 250 entries. Use the paging controls
 at the bottom of the browser to move between pages without waiting for the

@@ -8,6 +8,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
+import { createTerminalWebSocketServer, TERMINAL_SOCKET_PATH, websocketOriginAllowed } from './terminal-server.mjs';
 
 const PORT = Number(process.env.INV_VIEWER_PORT || 4174);
 const CACHE_DIRECTORY = '.inv-cache';
@@ -327,7 +328,16 @@ const server = createServer(async (request, response) => {
     sendJson(response, 404, { error: 'Not found.' });
   } catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
 });
-const liveWebSockets = new WebSocketServer({ server, path: '/api/live' });
+const liveWebSockets = new WebSocketServer({ noServer: true });
+const terminalWebSockets = createTerminalWebSocketServer();
+server.on('upgrade', (request, socket, head) => {
+  if (!websocketOriginAllowed(request)) { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy(); return; }
+  let path;
+  try { path = new URL(request.url || '/', `http://${request.headers.host}`).pathname; } catch { socket.destroy(); return; }
+  const webSockets = path === '/api/live' ? liveWebSockets : path === TERMINAL_SOCKET_PATH ? terminalWebSockets : null;
+  if (!webSockets) { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroy(); return; }
+  webSockets.handleUpgrade(request, socket, head, (client) => webSockets.emit('connection', client, request));
+});
 publishJobUpdate = (job) => {
   const message = JSON.stringify({ type: 'job', job });
   for (const client of liveWebSockets.clients) if (client.readyState === WebSocket.OPEN) client.send(message);
@@ -360,4 +370,13 @@ liveWebSockets.on('connection', (socket) => {
   });
   socket.once('close', stopWatching);
 });
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) server.listen(PORT, '127.0.0.1', () => console.log(`Uninvert API listening on http://127.0.0.1:${PORT}`));
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  server.listen(PORT, '127.0.0.1', () => console.log(`Uninvert API listening on http://127.0.0.1:${PORT}`));
+  const shutdown = () => {
+    for (const client of terminalWebSockets.clients) client.terminate();
+    for (const client of liveWebSockets.clients) client.terminate();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 1_000).unref();
+  };
+  process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
+}
