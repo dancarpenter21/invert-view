@@ -6,7 +6,7 @@ import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, isConventionalInvertedName, isInvertedMedia, isWatchableChange, rangeFor, restoredName, restoredText, saveRestoredText, server, textMimeFor, validateFolderName, watchDirectoryChanges, xor } from '../server.mjs';
+import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, isConventionalInvertedName, isInvertedMedia, isWatchableChange, rangeFor, restoredName, restoredText, saveRestoredText, server, textMimeFor, validateFolderName, videoFrameDurationMs, watchDirectoryChanges, xor } from '../server.mjs';
 
 async function waitFor(check, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -47,6 +47,12 @@ test('media byte ranges select only the requested restored bytes', () => {
   assert.throws(() => rangeFor('bytes=10-12', 10), /not satisfiable/);
 });
 
+test('AVI frame timing is read from its main header', () => {
+  const avi = Buffer.alloc(64); avi.write('RIFF', 0); avi.write('AVI ', 8); avi.write('avih', 24); avi.writeUInt32LE(33_367, 32);
+  assert.equal(videoFrameDurationMs(avi), 33.367);
+  assert.equal(videoFrameDurationMs(Buffer.from('not video')), null);
+});
+
 test('aborted media streams stay available and legacy video gains cached compatible playback', { timeout: 30_000 }, async () => {
   const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-playback-')); const plain = join(directory, 'clip.avi'); const source = join(directory, 'clip.inv.avi'); const prepared = join(directory, 'prepared.mp4');
   try {
@@ -67,6 +73,7 @@ test('aborted media streams stay available and legacy video gains cached compati
     const range = await fetch(`${base}/api/videos/playback?path=${encodeURIComponent('clip.inv.avi')}`, { headers: { range: 'bytes=0-31' } }); const rangeBytes = Buffer.from(await range.arrayBuffer()); assert.equal(range.status, 206); assert.equal(range.headers.get('content-type'), 'video/mp4'); assert.equal(rangeBytes.length, 32); assert.equal(rangeBytes.subarray(4, 8).toString('ascii'), 'ftyp');
     const complete = await fetch(`${base}/api/videos/playback?path=${encodeURIComponent('clip.inv.avi')}`); await fs.writeFile(prepared, Buffer.from(await complete.arrayBuffer())); const probed = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name,codec_type', '-of', 'json', prepared]); assert.equal(probed.status, 0, probed.stderr?.toString()); const streams = JSON.parse(probed.stdout.toString()).streams; assert(streams.some((stream) => stream.codec_type === 'video' && stream.codec_name === 'h264')); assert(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
     const manifest = JSON.parse(await fs.readFile(join(directory, '.inv-cache', 'manifest.json'), 'utf8')); const cached = await fs.readFile(manifest.files['clip.inv.avi'].playback); assert.equal(detectMime(cached), 'application/octet-stream'); assert.equal(detectMime(xor(cached.subarray(0, 32))), 'video/mp4');
+    const extractedResponse = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 500 }) }); const extracted = await extractedResponse.json(); assert.equal(extractedResponse.status, 201); assert.match(extracted.name, /^clip\.frame-000000500\.inv\.jpg$/); const extractedBytes = await fs.readFile(join(directory, extracted.name)); assert.equal(detectMime(extractedBytes), 'application/octet-stream'); assert.equal(detectMime(xor(extractedBytes)), 'image/jpeg');
     const sourceInfo = await fs.stat(source); await fs.utimes(source, sourceInfo.atime, new Date(sourceInfo.mtimeMs + 2_000)); const invalidated = await fetch(`${base}/api/videos/playback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi' }) }); const replacement = await invalidated.json(); assert.equal(invalidated.status, 202); assert.notEqual(replacement.job.id, first.job.id);
     const replacementDeadline = Date.now() + 20_000; let replacementJob; while (!replacementJob || (replacementJob.status !== 'complete' && replacementJob.status !== 'failed')) { if (Date.now() >= replacementDeadline) throw new Error(`Timed out waiting for replacement playback preparation: ${replacementJob?.error || 'no job result'}`); const snapshot = await (await fetch(`${base}/api/jobs`)).json(); replacementJob = snapshot.find((job) => job.id === replacement.job.id); await new Promise((resolveWait) => setTimeout(resolveWait, 25)); } assert.equal(replacementJob.status, 'complete', replacementJob.error);
   } finally {

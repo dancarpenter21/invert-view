@@ -4,7 +4,7 @@ import { BrowserTerminal } from './terminal';
 type Filter = 'all' | 'images' | 'videos' | 'other';
 type SortOrder = 'ascending' | 'descending';
 type ViewMode = 'detailed' | 'small' | 'medium' | 'large';
-type CatalogFile = { path: string; name: string; size: number; modified: number; mime: string; kind: Exclude<Filter, 'all'>; editableText?: boolean; thumbnail: string | 'pending' | null };
+type CatalogFile = { path: string; name: string; size: number; modified: number; mime: string; kind: Exclude<Filter, 'all'>; editableText?: boolean; thumbnail: string | 'pending' | null; frameDurationMs?: number };
 type DirectoryEntry = { path: string; name: string; directory: true };
 type CatalogEntry = CatalogFile | DirectoryEntry;
 type Job = { id: string; type: 'thumbnail' | 'frames' | 'playback'; path: string; status: 'queued' | 'running' | 'complete' | 'failed'; progress: number; error: string | null; createdAt: number };
@@ -154,9 +154,25 @@ function selectEntry(entry: CatalogEntry, event: MouseEvent): void {
   renderCatalog();
 }
 
+function createVideoTools(file: CatalogFile, video: HTMLVideoElement): HTMLDivElement {
+  const tools = document.createElement('div'); tools.className = 'video-frame-tools'; tools.innerHTML = '<button type="button" data-step="-1">◀ Previous frame</button><button type="button" data-step="1">Next frame ▶</button><button type="button" class="extract-frame">Extract current frame</button><span></span>';
+  const frameDurationMs = file.frameDurationMs || 1_000 / 30; const status = tools.querySelector('span'); if (status) status.textContent = `${(1_000 / frameDurationMs).toFixed(2)} fps`;
+  tools.querySelectorAll<HTMLButtonElement>('[data-step]').forEach((button) => button.addEventListener('click', () => { video.pause(); const maximum = Number.isFinite(video.duration) ? Math.max(0, video.duration - frameDurationMs / 2_000) : Number.POSITIVE_INFINITY; video.currentTime = Math.min(maximum, Math.max(0, video.currentTime + Number(button.dataset.step) * frameDurationMs / 1_000)); }));
+  const extract = tools.querySelector<HTMLButtonElement>('.extract-frame'); extract?.addEventListener('click', async () => {
+    extract.disabled = true; const label = extract.textContent; extract.textContent = 'Extracting…'; video.pause();
+    try { const result = await api<{ name: string }>('/api/videos/frame', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: file.path, timeMs: Math.round(video.currentTime * 1_000) }) }); state.catalogDirty = true; toast(`Saved ${result.name}`); }
+    catch (error) { toast(error instanceof Error ? error.message : String(error)); }
+    finally { extract.disabled = false; extract.textContent = label; }
+  });
+  return tools;
+}
+function startVideoWhenReady(video: HTMLVideoElement): void {
+  video.autoplay = true; video.playsInline = true;
+  video.addEventListener('canplay', () => { void video.play().catch(() => { /* Controls remain available if browser policy blocks autoplay. */ }); }, { once: true });
+}
 function renderPreparedVideo(file: CatalogFile): void {
   if (state.screen !== 'viewer' || state.selected?.path !== file.path) return;
-  const media = find<HTMLElement>('#viewer-media'); media.innerHTML = ''; const video = document.createElement('video'); video.src = playbackUrl(file); video.controls = true; video.muted = true; video.defaultMuted = true; video.preload = 'metadata'; video.className = 'viewer-video'; video.setAttribute('aria-label', `Compatible player for ${restoredName(file.name)}`); video.addEventListener('error', () => { if (state.selected?.path === file.path) media.innerHTML = '<p class="viewer-error">The compatible video could not be loaded. You can still restore and download the original file.</p>'; }); media.append(video);
+  const media = find<HTMLElement>('#viewer-media'); media.innerHTML = ''; const video = document.createElement('video'); video.src = playbackUrl(file); video.controls = true; video.muted = true; video.defaultMuted = true; video.preload = 'metadata'; video.className = 'viewer-video'; video.setAttribute('aria-label', `Compatible player for ${restoredName(file.name)}`); video.addEventListener('error', () => { if (state.selected?.path === file.path) media.innerHTML = '<p class="viewer-error">The compatible video could not be loaded. You can still restore and download the original file.</p>'; }); startVideoWhenReady(video); media.append(video, createVideoTools(file, video));
 }
 function renderPlaybackJob(file: CatalogFile, job: Job): void {
   if (state.screen !== 'viewer' || state.selected?.path !== file.path) return;
@@ -180,7 +196,7 @@ async function preparePlayback(file: CatalogFile): Promise<void> {
   } catch (error) { if (state.screen === 'viewer' && state.selected?.path === file.path) media.innerHTML = `<p class="viewer-error">${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`; }
 }
 function renderNativeVideo(file: CatalogFile): void {
-  const media = find<HTMLElement>('#viewer-media'); const video = document.createElement('video'); let fallingBack = false; video.src = mediaUrl(file); video.controls = true; video.muted = true; video.defaultMuted = true; video.preload = 'metadata'; video.className = 'viewer-video'; video.setAttribute('aria-label', `Full player for ${restoredName(file.name)}`); video.addEventListener('error', () => { if (fallingBack || state.selected?.path !== file.path) return; fallingBack = true; video.removeAttribute('src'); video.load(); void preparePlayback(file); }); media.append(video);
+  const media = find<HTMLElement>('#viewer-media'); const video = document.createElement('video'); let fallingBack = false; video.src = mediaUrl(file); video.controls = true; video.muted = true; video.defaultMuted = true; video.preload = 'metadata'; video.className = 'viewer-video'; video.setAttribute('aria-label', `Full player for ${restoredName(file.name)}`); video.addEventListener('error', () => { if (fallingBack || state.selected?.path !== file.path) return; fallingBack = true; video.removeAttribute('src'); video.load(); void preparePlayback(file); }); startVideoWhenReady(video); media.append(video, createVideoTools(file, video));
 }
 async function openViewer(file: CatalogFile): Promise<void> {
   stopPreviewVideo(); find<HTMLElement>('.app-shell').classList.remove('preview-visible'); state.selected = file; state.screen = 'viewer'; state.textDirty = false; find('#catalog-view').setAttribute('hidden', ''); find('#viewer').removeAttribute('hidden'); find('#search-wrap').setAttribute('hidden', ''); find('#location-name').textContent = restoredName(file.name); const viewer = find<HTMLElement>('#viewer'); viewer.innerHTML = `<div class="viewer-head"><button class="back-button" id="back-button">← Back to files</button><div><h1>${escapeHtml(restoredName(file.name))}</h1><p>${escapeHtml(file.mime)} · ${formatSize(file.size)} · ${formatModified(file.modified)}</p></div><button class="restore-button viewer-download" id="restore-button">Restore &amp; download <span>↓</span></button></div><div class="viewer-media" id="viewer-media"></div>`;

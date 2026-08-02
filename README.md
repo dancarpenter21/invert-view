@@ -5,10 +5,11 @@ It determines an inverted file's restored MIME type from its file signature,
 hides recognizable files that are already uninverted, then streams restored
 images and videos to the browser without uploading them. Video playback uses
 seekable byte-range streaming, so restored files do not need to fit in memory.
-Video previews and full players start muted; the full player retains its
-original audio and complete seekable duration when the browser supports the
-source container and codecs. Legacy formats such as AVI/DivX are converted on
-demand to a seekable H.264/AAC MP4 without changing the source file.
+Video previews start muted. Full players start muted and play automatically as
+soon as the video is ready; they retain the original audio and complete seekable
+duration when the browser supports the source container and codecs. Legacy
+formats such as AVI/DivX are converted on demand to a seekable H.264/AAC MP4
+without changing the source file.
 
 ## Requirements
 
@@ -98,6 +99,12 @@ conversion progress, and the job continues if you return to the catalog. Plain
 restored and transcoded intermediates exist only in the operating system's
 temporary directory and are removed when the job finishes or fails. Restore &
 download always returns the original restored format, not the cached derivative.
+
+The full video player includes previous-frame and next-frame buttons. AVI files
+use their declared frame interval; other containers fall back to a 30 fps step.
+**Extract current frame** pauses at the displayed time and writes an inverted
+JPEG beside the source with a timestamped name such as
+`fight.frame-000042123.inv.jpg`. Existing captures are never overwritten.
 
 Right-click a video card and choose **Explode into frames** to export every
 decoded frame. Inverted JPEGs are placed beside the source video in a visible
