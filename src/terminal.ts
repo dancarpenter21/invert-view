@@ -36,6 +36,7 @@ export class BrowserTerminal {
   private connectionGeneration = 0;
   private resizeFrame: number | null = null;
   private lastDimensions = '';
+  private pendingDirectory: string | null = null;
 
   constructor(dock: HTMLElement, getWorkingDirectory: () => string) {
     this.dock = dock; this.getWorkingDirectory = getWorkingDirectory;
@@ -50,6 +51,12 @@ export class BrowserTerminal {
   }
 
   activate(): void { this.active = true; if (this.expanded) this.ensureTerminal(); }
+
+  moveToDirectory(directory: string): boolean {
+    this.active = true; this.pendingDirectory = directory;
+    if (!this.expanded) { this.expanded = true; try { window.localStorage.setItem(OPEN_KEY, 'true'); } catch { /* State persistence is optional. */ } this.renderExpandedState(); }
+    this.ensureTerminal(); const movedImmediately = this.ready && !this.busy; this.flushDirectoryChange(); return movedImmediately;
+  }
 
   private required<T extends Element>(selector: string): T {
     const element = this.dock.querySelector<T>(selector); if (!element) throw new Error(`Required terminal element not found: ${selector}`); return element;
@@ -132,8 +139,8 @@ export class BrowserTerminal {
       try {
         const message = JSON.parse(String(event.data)) as TerminalServerMessage;
         if (message.type === 'output') this.terminal?.write(message.data);
-        else if (message.type === 'ready') { this.ready = true; this.exited = false; this.setStatus('Ready', 'ready'); this.scheduleFit(); this.terminal?.focus(); }
-        else if (message.type === 'status') { this.busy = message.busy; this.setStatus(message.busy ? 'Running' : 'Ready', message.busy ? 'busy' : 'ready'); }
+        else if (message.type === 'ready') { this.ready = true; this.exited = false; this.setStatus('Ready', 'ready'); this.scheduleFit(); this.flushDirectoryChange(); this.terminal?.focus(); }
+        else if (message.type === 'status') { this.busy = message.busy; this.setStatus(message.busy ? 'Running' : 'Ready', message.busy ? 'busy' : 'ready'); if (!message.busy) this.flushDirectoryChange(); }
         else if (message.type === 'exit') { this.ready = false; this.busy = false; this.exited = true; this.terminal?.writeln(`\r\n\x1b[90m[process exited with code ${message.code}${message.signal ? `, signal ${message.signal}` : ''}]\x1b[0m`); this.setStatus('Exited', 'exited'); }
         else if (message.type === 'error') { this.terminal?.writeln(`\r\n\x1b[31m${message.message}\x1b[0m`); this.setStatus('Error', 'error'); }
       } catch { this.setStatus('Protocol error', 'error'); }
@@ -148,6 +155,11 @@ export class BrowserTerminal {
   private dimensions(): { cols: number; rows: number } { return { cols: Math.max(2, this.terminal?.cols || 80), rows: Math.max(1, this.terminal?.rows || 24) }; }
 
   private send(message: object): void { if (this.ready && this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message)); }
+
+  private flushDirectoryChange(): void {
+    if (!this.pendingDirectory || !this.ready || this.busy) return;
+    const directory = this.pendingDirectory; this.pendingDirectory = null; const quoted = `'${directory.replaceAll("'", "'\\''")}'`; this.send({ type: 'input', data: `cd -- ${quoted}\r` }); this.terminal?.focus();
+  }
 
   private scheduleFit(): void {
     if (!this.expanded || !this.terminal || !this.fitAddon) return;

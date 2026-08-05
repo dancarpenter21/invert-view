@@ -18,6 +18,7 @@ const FRAME_METADATA_FILE = '.inv-frames.json';
 const HEADER_BYTES = 8192;
 const MAX_TEXT_BYTES = 5 * 1024 * 1024;
 const WATCH_DEBOUNCE_MS = 200;
+class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 const TEXT_MIME_BY_EXTENSION = new Map([
   ['.txt', 'text/plain'], ['.md', 'text/markdown'], ['.json', 'application/json'], ['.yaml', 'text/yaml'], ['.yml', 'text/yaml'], ['.csv', 'text/csv'], ['.log', 'text/plain'], ['.xml', 'application/xml'], ['.html', 'text/html'], ['.css', 'text/css'], ['.js', 'text/javascript'], ['.ts', 'text/plain'],
 ]);
@@ -175,13 +176,18 @@ export async function restoredText(source) {
   try { return new TextDecoder('utf-8', { fatal: true }).decode(xor(await fs.readFile(source))); }
   catch (error) { if (error instanceof TypeError) throw new Error('The restored file is not valid UTF-8 text.'); throw error; }
 }
-export async function saveRestoredText(source, content) {
+async function restoredTextSnapshot(source) {
+  for (let attempt = 0; attempt < 2; attempt += 1) { const before = await fileFingerprint(source); const content = await restoredText(source); const after = await fileFingerprint(source); if (fingerprintMatches(before, after)) return { content, size: after.size, modified: after.modifiedMs }; }
+  throw new HttpError(409, 'The text file changed while it was being read. Try opening it again.');
+}
+export async function saveRestoredText(source, content, expected = null, force = false) {
   if (typeof content !== 'string') throw new Error('Text content is required.');
   const restored = Buffer.from(content, 'utf8');
   if (restored.length > MAX_TEXT_BYTES) throw new Error('Text files larger than 5 MB cannot be edited in the browser.');
-  const temporary = `${source}.${randomUUID()}.tmp`;
-  await fs.writeFile(temporary, xor(restored));
-  await fs.rename(temporary, source);
+  const assertCurrent = async () => { if (!force && expected && !fingerprintMatches(expected, await fileFingerprint(source))) throw new HttpError(409, 'This file changed on disk after it was opened.'); };
+  const temporary = `${source}.${randomUUID()}.tmp`; await assertCurrent();
+  try { await fs.writeFile(temporary, xor(restored)); await assertCurrent(); await fs.rename(temporary, source); }
+  finally { await fs.rm(temporary, { force: true }); }
 }
 async function isCurrentThumbnail(relativePath, source, manifest) {
   const currentManifest = manifest || await readManifest(); const entry = currentManifest.files[relativePath];
@@ -266,13 +272,15 @@ async function playbackJob(job, relativePath, source) {
   finally { await Promise.all([restored, encoded, staged].filter(Boolean).map((item) => fs.rm(item, { force: true }))); }
   return job;
 }
-async function resolveFrameOutputDirectory(value, source) {
+async function resolveOutputDirectory(value, source, label) {
   if (value === undefined || value === null || value === '') return dirname(source);
-  if (typeof value !== 'string' || !isAbsolute(value)) throw new Error('The extracted frame directory must be an absolute path.');
+  if (typeof value !== 'string' || !isAbsolute(value)) throw new Error(`The ${label} directory must be an absolute path.`);
   const directory = resolve(value); const info = await fs.stat(directory);
-  if (!info.isDirectory()) throw new Error('The extracted frame path is not a directory.');
+  if (!info.isDirectory()) throw new Error(`The ${label} path is not a directory.`);
   await fs.access(directory, fsConstants.W_OK); return directory;
 }
+async function resolveFrameOutputDirectory(value, source) { return resolveOutputDirectory(value, source, 'extracted frame'); }
+async function resolveVideoOutputDirectory(value, source) { return resolveOutputDirectory(value, source, 'extracted video'); }
 async function availableFrameDestination(relativePath, timeMs, directory) {
   const stem = stemFor(relativePath); const timestamp = String(Math.round(timeMs)).padStart(9, '0');
   for (let copy = 1; ; copy += 1) {
@@ -288,6 +296,37 @@ async function extractVideoFrame(relativePath, source, timeMs, directory) {
     const destination = await availableFrameDestination(relativePath, timeMs, directory); staged = `${destination}.${randomUUID()}.tmp`; await invertFile(jpeg, staged); await fs.rename(staged, destination); staged = null;
     return { outputPath: destination, name: basename(destination), timeMs: Math.round(timeMs) };
   } finally { await Promise.all([restored, jpeg, staged].filter(Boolean).map((item) => fs.rm(item, { force: true }))); }
+}
+function segmentName(relativePath, startMs, endMs, copy = 1) {
+  const start = String(Math.round(startMs)).padStart(9, '0'); const end = String(Math.round(endMs)).padStart(9, '0'); const suffix = copy === 1 ? '' : `-${copy}`;
+  return `${stemFor(relativePath)}.segment-${start}-${end}${suffix}.inv.mp4`;
+}
+async function commitSegment(staged, relativePath, startMs, endMs, directory) {
+  for (let copy = 1; ; copy += 1) {
+    const destination = join(directory, segmentName(relativePath, startMs, endMs, copy));
+    try { await fs.link(staged, destination); await fs.rm(staged, { force: true }); return destination; }
+    catch (error) { if (error?.code !== 'EEXIST') throw error; }
+  }
+}
+async function segmentJob(job, relativePath, source, requestedStartMs, requestedEndMs, directory) {
+  job.status = 'running'; reportJob(job, true); let restored = null; let encoded = null; let staged = null;
+  try {
+    const initialFingerprint = await fileFingerprint(source); restored = await restoredTemporaryFile(source); const sourceDurationMs = await durationFor(restored);
+    if (!Number.isFinite(sourceDurationMs) || sourceDurationMs <= 0) throw new Error('The source video duration could not be determined.');
+    if (requestedStartMs >= sourceDurationMs) throw new Error('The segment start must be before the end of the video.');
+    if (requestedEndMs > sourceDurationMs + 250) throw new Error('The segment end is beyond the end of the video.');
+    const startMs = Math.round(requestedStartMs); const endMs = Math.round(Math.min(requestedEndMs, sourceDurationMs));
+    if (endMs <= startMs) throw new Error('The segment end must be after its start.');
+    job.durationMs = endMs - startMs; encoded = join(tmpdir(), `inv-viewer-${randomUUID()}.mp4`);
+    await runFfmpeg(['-i', restored, '-ss', (startMs / 1_000).toFixed(3), '-t', ((endMs - startMs) / 1_000).toFixed(3), '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', encoded], job);
+    if (!fingerprintMatches(initialFingerprint, await fileFingerprint(source))) throw new Error('The source video changed while the segment was being extracted.');
+    staged = join(directory, `.inv-viewer-segment-${randomUUID()}.tmp`); await invertFile(encoded, staged);
+    if (!fingerprintMatches(initialFingerprint, await fileFingerprint(source))) throw new Error('The source video changed while the segment was being extracted.');
+    const destination = await commitSegment(staged, relativePath, startMs, endMs, directory); staged = null;
+    job.result = { outputPath: destination, name: basename(destination), startMs, endMs }; job.status = 'complete'; job.progress = 1; reportJob(job, true);
+  } catch (error) { job.status = 'failed'; job.error = error instanceof Error ? error.message : String(error); reportJob(job, true); }
+  finally { await Promise.all([restored, encoded, staged].filter(Boolean).map((item) => fs.rm(item, { force: true }))); }
+  return job;
 }
 async function explodeJob(job, relativePath, source) {
   job.status = 'running'; reportJob(job, true); const paths = artifactPaths(relativePath);
@@ -371,11 +410,17 @@ async function renameEntry(path, requestedName) {
 }
 async function moveEntries(paths, destinationPath) {
   if (!Array.isArray(paths) || !paths.length) throw new Error('Select at least one item to move.');
-  const destination = await resolveDirectory(destinationPath || ''); const uniquePaths = [...new Set(paths)];
+  let destination;
+  if (destinationPath === '..') {
+    assertOpened(); destination = dirname(openedRoot);
+    if (destination === openedRoot) throw new Error('The opened folder has no parent directory.');
+    const info = await fs.stat(destination); if (!info.isDirectory()) throw new Error('The parent path is not a directory.'); await fs.readdir(destination);
+  } else destination = await resolveDirectory(destinationPath || '');
+  const uniquePaths = [...new Set(paths)];
   const entries = await Promise.all(uniquePaths.map(async (path) => ({ path, ...(await resolveManagedEntry(path)) })));
   const targets = entries.map(({ source }) => join(destination, basename(source)));
   if (new Set(targets).size !== targets.length) throw new Error('Selected items would use the same destination name.');
-  for (let index = 0; index < entries.length; index += 1) { const { source, info } = entries[index]; const target = targets[index]; if (dirname(source) === destination) throw new Error('An item is already in that folder.'); if (info.isDirectory() && (destination === source || destination.startsWith(`${source}${sep}`))) throw new Error('A folder cannot be moved into itself.'); try { await fs.access(target); throw new Error(`A destination item already exists: ${basename(target)}`); } catch (error) { if (error?.code !== 'ENOENT') throw error; } }
+  for (let index = 0; index < entries.length; index += 1) { const { source, info } = entries[index]; const target = targets[index]; if (dirname(source) === destination) throw new Error('An item is already in that folder.'); if (info.isDirectory() && (destination === source || destination.startsWith(`${source}${sep}`))) throw new Error('A folder cannot be moved into itself.'); try { await fs.lstat(target); throw new Error(`A destination item already exists: ${basename(target)}`); } catch (error) { if (error?.code !== 'ENOENT') throw error; } }
   for (let index = 0; index < entries.length; index += 1) await fs.rename(entries[index].source, targets[index]);
 }
 async function deleteEntries(paths) {
@@ -411,12 +456,13 @@ async function handleRequest(request, response) {
     if (request.method === 'DELETE' && path === '/api/files') { const body = await readJson(request); await deleteEntries(body.paths); return sendJson(response, 200, { ok: true }); }
     if (request.method === 'POST' && path === '/api/videos/explode') { const body = await readJson(request); const source = resolveSource(body.path); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be exploded.'); const job = createJob('frames', body.path); void explodeJob(job, body.path, source); return sendJson(response, 202, job); }
     if (request.method === 'POST' && path === '/api/videos/frame') { const body = await readJson(request); const relativePath = String(body.path || ''); const timeMs = Number(body.timeMs); if (!Number.isFinite(timeMs) || timeMs < 0) throw new Error('A valid video time is required.'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide frames.'); const directory = await resolveFrameOutputDirectory(body.outputDirectory, source); return sendJson(response, 201, await extractVideoFrame(relativePath, source, timeMs, directory)); }
+    if (request.method === 'POST' && path === '/api/videos/segment') { const body = await readJson(request); const relativePath = String(body.path || ''); const startMs = body.startMs; const endMs = body.endMs; if (typeof startMs !== 'number' || !Number.isFinite(startMs) || startMs < 0 || typeof endMs !== 'number' || !Number.isFinite(endMs) || endMs <= startMs) throw new Error('A valid segment start and end are required.'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide segments.'); const directory = await resolveVideoOutputDirectory(body.outputDirectory, source); const job = createJob('segment', relativePath); void segmentJob(job, relativePath, source, startMs, endMs, directory); return sendJson(response, 202, job); }
     if (request.method === 'POST' && path === '/api/videos/playback') { const body = await readJson(request); const relativePath = String(body.path || ''); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be prepared for playback.'); if (await currentPlaybackPath(relativePath, source)) return sendJson(response, 200, { status: 'ready', url: `/api/videos/playback?path=${encodeURIComponent(relativePath)}` }); const active = activePlaybackJob(relativePath); if (active) return sendJson(response, 202, { status: 'preparing', job: active }); const job = createJob('playback', relativePath); void playbackJob(job, relativePath, source); return sendJson(response, 202, { status: 'preparing', job }); }
     if (request.method === 'GET' && path === '/api/videos/playback') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const playback = await currentPlaybackPath(relativePath, source); if (!playback) throw new Error('A compatible playback copy is not ready.'); const sourceName = restoredName(basename(relativePath)); const filename = `${basename(sourceName, extname(sourceName)) || 'video'}.mp4`; return serveRestored(request, response, playback, 'video/mp4', filename); }
     if (request.method === 'GET' && path === '/api/media') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); return serveRestored(request, response, source, mime, restoredName(basename(source))); }
     if (request.method === 'GET' && path === '/api/thumbnail') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const manifest = await readManifest(); const thumbnail = manifest.files[relativePath]?.thumbnail; if (!thumbnail) throw new Error('Thumbnail is not ready.'); return serveRestored(request, response, thumbnail, 'image/jpeg', basename(thumbnail)); }
-    if (request.method === 'GET' && path === '/api/text') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); if (!textMimeFor(basename(source)) || !isConventionalInvertedName(basename(source))) throw new Error('Only supported inverted text files can be edited.'); const info = await fs.stat(source); return sendJson(response, 200, { content: await restoredText(source), size: info.size, modified: info.mtimeMs }); }
-    if (request.method === 'PUT' && path === '/api/text') { const body = await readJson(request); const source = resolveSource(body.path); if (!textMimeFor(basename(source)) || !isConventionalInvertedName(basename(source))) throw new Error('Only supported inverted text files can be edited.'); await saveRestoredText(source, body.content); const info = await fs.stat(source); return sendJson(response, 200, { size: info.size, modified: info.mtimeMs }); }
+    if (request.method === 'GET' && path === '/api/text') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); if (!textMimeFor(basename(source)) || !isConventionalInvertedName(basename(source))) throw new Error('Only supported inverted text files can be edited.'); return sendJson(response, 200, await restoredTextSnapshot(source)); }
+    if (request.method === 'PUT' && path === '/api/text') { const body = await readJson(request); const source = resolveSource(body.path); if (!textMimeFor(basename(source)) || !isConventionalInvertedName(basename(source))) throw new Error('Only supported inverted text files can be edited.'); const expectedSize = body.expectedSize; const expectedModified = body.expectedModified; if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || typeof expectedModified !== 'number' || !Number.isFinite(expectedModified)) throw new Error('The original text file fingerprint is required.'); await saveRestoredText(source, body.content, { size: expectedSize, modifiedMs: expectedModified }, body.force === true); const info = await fs.stat(source); return sendJson(response, 200, { size: info.size, modified: info.mtimeMs }); }
     if (request.method === 'GET' && !path.startsWith('/api/')) return serveApplication(response, path);
     sendJson(response, 404, { error: 'Not found.' });
 }
@@ -424,7 +470,7 @@ export const server = createServer((request, response) => {
   void handleRequest(request, response).catch((error) => {
     if (isClientDisconnect(error, request)) return;
     if (response.headersSent) { response.destroy(error); return; }
-    sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+    sendJson(response, Number.isInteger(error?.status) ? error.status : 400, { error: error instanceof Error ? error.message : String(error) });
   });
 });
 const liveWebSockets = new WebSocketServer({ noServer: true });

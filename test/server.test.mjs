@@ -54,7 +54,7 @@ test('AVI frame timing is read from its main header', () => {
 });
 
 test('aborted media streams stay available and legacy video gains cached compatible playback', { timeout: 30_000 }, async () => {
-  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-playback-')); const frameOutput = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-captures-')); const plain = join(directory, 'clip.avi'); const source = join(directory, 'clip.inv.avi'); const prepared = join(directory, 'prepared.mp4');
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-playback-')); const frameOutput = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-captures-')); const segmentOutput = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-segments-')); const plain = join(directory, 'clip.avi'); const source = join(directory, 'clip.inv.avi'); const prepared = join(directory, 'prepared.mp4'); const restoredSegment = join(directory, 'segment.mp4');
   try {
     const generated = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=64x48:rate=10', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '1', '-c:v', 'mpeg4', '-c:a', 'mp3', plain]);
     assert.equal(generated.status, 0, generated.stderr?.toString());
@@ -76,11 +76,16 @@ test('aborted media streams stay available and legacy video gains cached compati
     const extractedResponse = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 500 }) }); const extracted = await extractedResponse.json(); assert.equal(extractedResponse.status, 201); assert.match(extracted.name, /^clip\.frame-000000500\.inv\.jpg$/); assert.equal(extracted.outputPath, join(directory, extracted.name)); const extractedBytes = await fs.readFile(extracted.outputPath); assert.equal(detectMime(extractedBytes), 'application/octet-stream'); assert.equal(detectMime(xor(extractedBytes)), 'image/jpeg');
     await fs.writeFile(join(frameOutput, 'clip.frame-000000600.inv.jpg'), Buffer.from('existing')); const configuredResponse = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 600, outputDirectory: frameOutput }) }); const configured = await configuredResponse.json(); assert.equal(configuredResponse.status, 201); assert.equal(configured.name, 'clip.frame-000000600-2.inv.jpg'); assert.equal(configured.outputPath, join(frameOutput, configured.name)); assert.equal(detectMime(xor(await fs.readFile(configured.outputPath))), 'image/jpeg');
     for (const outputDirectory of ['relative/path', join(frameOutput, 'missing'), prepared]) { const invalid = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 700, outputDirectory }) }); assert.equal(invalid.status, 400); }
+    await fs.writeFile(join(segmentOutput, 'clip.segment-000000200-000000800.inv.mp4'), Buffer.from('existing')); const segmentResponse = await fetch(`${base}/api/videos/segment`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', startMs: 200, endMs: 800, outputDirectory: segmentOutput }) }); const queuedSegment = await segmentResponse.json(); assert.equal(segmentResponse.status, 202); assert.equal(queuedSegment.type, 'segment');
+    let segmentJob; const segmentDeadline = Date.now() + 20_000; while (!segmentJob || (segmentJob.status !== 'complete' && segmentJob.status !== 'failed')) { if (Date.now() >= segmentDeadline) throw new Error(`Timed out waiting for segment extraction: ${segmentJob?.error || 'no job result'}`); const snapshot = await (await fetch(`${base}/api/jobs`)).json(); segmentJob = snapshot.find((job) => job.id === queuedSegment.id); await new Promise((resolveWait) => setTimeout(resolveWait, 25)); } assert.equal(segmentJob.status, 'complete', segmentJob.error); assert.equal(segmentJob.result.name, 'clip.segment-000000200-000000800-2.inv.mp4'); assert.equal(segmentJob.result.outputPath, join(segmentOutput, segmentJob.result.name)); assert.deepEqual({ startMs: segmentJob.result.startMs, endMs: segmentJob.result.endMs }, { startMs: 200, endMs: 800 });
+    const invertedSegment = await fs.readFile(segmentJob.result.outputPath); assert.equal(detectMime(invertedSegment), 'application/octet-stream'); await fs.writeFile(restoredSegment, xor(invertedSegment)); const segmentProbe = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_name,codec_type', '-of', 'json', restoredSegment]); assert.equal(segmentProbe.status, 0, segmentProbe.stderr?.toString()); const segmentMedia = JSON.parse(segmentProbe.stdout.toString()); assert(segmentMedia.streams.some((stream) => stream.codec_type === 'video' && stream.codec_name === 'h264')); assert(segmentMedia.streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac')); assert(Number(segmentMedia.format.duration) >= 0.45 && Number(segmentMedia.format.duration) <= 0.8);
+    for (const [startMs, endMs] of [[-1, 500], [500, 500], [700, 200], [null, 500]]) { const invalid = await fetch(`${base}/api/videos/segment`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', startMs, endMs, outputDirectory: segmentOutput }) }); assert.equal(invalid.status, 400); }
+    const invalidSegmentDirectory = await fetch(`${base}/api/videos/segment`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', startMs: 100, endMs: 500, outputDirectory: 'relative/path' }) }); assert.equal(invalidSegmentDirectory.status, 400);
     const sourceInfo = await fs.stat(source); await fs.utimes(source, sourceInfo.atime, new Date(sourceInfo.mtimeMs + 2_000)); const invalidated = await fetch(`${base}/api/videos/playback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi' }) }); const replacement = await invalidated.json(); assert.equal(invalidated.status, 202); assert.notEqual(replacement.job.id, first.job.id);
     const replacementDeadline = Date.now() + 20_000; let replacementJob; while (!replacementJob || (replacementJob.status !== 'complete' && replacementJob.status !== 'failed')) { if (Date.now() >= replacementDeadline) throw new Error(`Timed out waiting for replacement playback preparation: ${replacementJob?.error || 'no job result'}`); const snapshot = await (await fetch(`${base}/api/jobs`)).json(); replacementJob = snapshot.find((job) => job.id === replacement.job.id); await new Promise((resolveWait) => setTimeout(resolveWait, 25)); } assert.equal(replacementJob.status, 'complete', replacementJob.error);
   } finally {
     if (server.listening) await new Promise((resolveClose) => server.close(resolveClose));
-    await Promise.all([directory, frameOutput].map((item) => fs.rm(item, { recursive: true, force: true })));
+    await Promise.all([directory, frameOutput, segmentOutput].map((item) => fs.rm(item, { recursive: true, force: true })));
   }
 });
 
@@ -165,6 +170,29 @@ test('rename API renames files and folders without overwriting existing entries'
   }
 });
 
+test('move API moves files and folders into child and parent directories safely', async () => {
+  const parent = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-move-')); const root = join(parent, 'library');
+  try {
+    await fs.mkdir(join(root, 'target'), { recursive: true }); await fs.mkdir(join(root, 'album')); await fs.writeFile(join(root, 'album', 'nested.inv.txt'), xor(Buffer.from('nested'))); await fs.writeFile(join(root, 'one.inv.txt'), xor(Buffer.from('one')));
+    server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); assert(address && typeof address === 'object'); const base = `http://127.0.0.1:${address.port}`;
+    const move = (paths, destination) => fetch(`${base}/api/files/move`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ paths, destination }) });
+    assert.equal((await fetch(`${base}/api/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: root }) })).status, 200);
+
+    assert.equal((await move(['one.inv.txt', 'album'], 'target')).status, 200); assert.equal(await restoredText(join(root, 'target', 'one.inv.txt')), 'one'); assert.equal(await restoredText(join(root, 'target', 'album', 'nested.inv.txt')), 'nested');
+    assert.equal((await move(['target/one.inv.txt'], 'target')).status, 400);
+
+    await fs.writeFile(join(root, 'free.inv.txt'), xor(Buffer.from('free'))); await fs.writeFile(join(root, 'collision.inv.txt'), xor(Buffer.from('source'))); await fs.writeFile(join(root, 'target', 'collision.inv.txt'), xor(Buffer.from('target')));
+    assert.equal((await move(['free.inv.txt', 'collision.inv.txt'], 'target')).status, 400); assert.equal(await restoredText(join(root, 'free.inv.txt')), 'free'); assert.equal(await restoredText(join(root, 'collision.inv.txt')), 'source');
+    await fs.mkdir(join(root, 'tree', 'child'), { recursive: true }); assert.equal((await move(['tree'], 'tree/child')).status, 400);
+
+    await fs.writeFile(join(root, 'outward.inv.txt'), xor(Buffer.from('outward'))); assert.equal((await move(['outward.inv.txt'], '..')).status, 200); assert.equal(await restoredText(join(parent, 'outward.inv.txt')), 'outward'); await assert.rejects(fs.stat(join(root, 'outward.inv.txt')));
+    assert.equal((await move(['../outward.inv.txt'], 'target')).status, 400); assert.equal((await move(['free.inv.txt'], '../outside')).status, 400);
+  } finally {
+    if (server.listening) await new Promise((resolveClose) => server.close(resolveClose));
+    await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
 test('cache activity is excluded from source directory notifications', () => {
   assert.equal(isWatchableChange('.inv-cache'), false);
   assert.equal(isWatchableChange(Buffer.from('.inv-cache')), false);
@@ -195,4 +223,22 @@ test('restored text saves back as an inverted UTF-8 source', async () => {
     assert.equal(await restoredText(source), 'after ✓');
     assert.deepEqual(await fs.readFile(source), xor(Buffer.from('after ✓')));
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('text API rejects stale saves and permits an explicit overwrite', async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-text-conflict-')); const source = join(directory, 'notes.inv.md');
+  try {
+    await fs.writeFile(source, xor(Buffer.from('# Original'))); server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); assert(address && typeof address === 'object'); const base = `http://127.0.0.1:${address.port}`;
+    assert.equal((await fetch(`${base}/api/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: directory }) })).status, 200); const loadedResponse = await fetch(`${base}/api/text?path=${encodeURIComponent('notes.inv.md')}`); const loaded = await loadedResponse.json(); assert.equal(loadedResponse.status, 200); assert.equal(loaded.content, '# Original');
+    await fs.writeFile(source, xor(Buffer.from('# External change is longer'))); const staleBody = { path: 'notes.inv.md', content: '# Editor change', expectedSize: loaded.size, expectedModified: loaded.modified };
+    const stale = await fetch(`${base}/api/text`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(staleBody) }); assert.equal(stale.status, 409); assert.match((await stale.json()).error, /changed on disk/); assert.equal(await restoredText(source), '# External change is longer');
+    const forced = await fetch(`${base}/api/text`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...staleBody, force: true }) }); const saved = await forced.json(); assert.equal(forced.status, 200); assert(Number.isFinite(saved.modified)); assert.equal(await restoredText(source), '# Editor change');
+    const missingFingerprint = await fetch(`${base}/api/text`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'notes.inv.md', content: 'unsafe' }) }); assert.equal(missingFingerprint.status, 400);
+  } finally { if (server.listening) await new Promise((resolveClose) => server.close(resolveClose)); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('restored text rejects invalid UTF-8 and content larger than 5 MB', async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-text-validation-')); const invalid = join(directory, 'invalid.inv.txt'); const oversized = join(directory, 'oversized.inv.txt');
+  try { await fs.writeFile(invalid, xor(Buffer.from([0xc3, 0x28]))); await assert.rejects(restoredText(invalid), /valid UTF-8/); await assert.rejects(saveRestoredText(oversized, 'x'.repeat(5 * 1024 * 1024 + 1)), /larger than 5 MB/); }
+  finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
