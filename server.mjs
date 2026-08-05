@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, createWriteStream, promises as fs, watch as watchFileSystem } from 'node:fs';
+import { constants as fsConstants, createReadStream, createWriteStream, promises as fs, watch as watchFileSystem } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { basename, dirname, extname, join, normalize, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -34,6 +34,11 @@ export const xor = (buffer) => {
 };
 
 export function restoredName(name) { return name.replace(/\.inv(?=\.[^.]+$|$)/i, ''); }
+
+export function invertedName(name) {
+  const extension = extname(name);
+  return extension.length > 1 ? `${name.slice(0, -extension.length)}.inv${extension}` : `${name}.inv`;
+}
 
 export function detectMime(header) {
   if (header.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return 'image/jpeg';
@@ -261,20 +266,27 @@ async function playbackJob(job, relativePath, source) {
   finally { await Promise.all([restored, encoded, staged].filter(Boolean).map((item) => fs.rm(item, { force: true }))); }
   return job;
 }
-async function availableFrameDestination(relativePath, timeMs) {
-  const directory = dirname(resolveSource(relativePath)); const stem = stemFor(relativePath); const timestamp = String(Math.round(timeMs)).padStart(9, '0');
+async function resolveFrameOutputDirectory(value, source) {
+  if (value === undefined || value === null || value === '') return dirname(source);
+  if (typeof value !== 'string' || !isAbsolute(value)) throw new Error('The extracted frame directory must be an absolute path.');
+  const directory = resolve(value); const info = await fs.stat(directory);
+  if (!info.isDirectory()) throw new Error('The extracted frame path is not a directory.');
+  await fs.access(directory, fsConstants.W_OK); return directory;
+}
+async function availableFrameDestination(relativePath, timeMs, directory) {
+  const stem = stemFor(relativePath); const timestamp = String(Math.round(timeMs)).padStart(9, '0');
   for (let copy = 1; ; copy += 1) {
     const suffix = copy === 1 ? '' : `-${copy}`; const destination = join(directory, `${stem}.frame-${timestamp}${suffix}.inv.jpg`);
-    try { await fs.access(destination); } catch (error) { if (error?.code === 'ENOENT') return destination; throw error; }
+    try { await fs.lstat(destination); } catch (error) { if (error?.code === 'ENOENT') return destination; throw error; }
   }
 }
-async function extractVideoFrame(relativePath, source, timeMs) {
+async function extractVideoFrame(relativePath, source, timeMs, directory) {
   let restored = null; let jpeg = null; let staged = null;
   try {
     restored = await restoredTemporaryFile(source); jpeg = join(tmpdir(), `inv-viewer-${randomUUID()}.jpg`);
     await runFfmpeg(['-ss', (timeMs / 1_000).toFixed(3), '-i', restored, '-frames:v', '1', '-q:v', '2', jpeg], {});
-    const destination = await availableFrameDestination(relativePath, timeMs); staged = `${destination}.${randomUUID()}.tmp`; await invertFile(jpeg, staged); await fs.rename(staged, destination); staged = null;
-    return { path: relative(openedRoot, destination), name: basename(destination), timeMs: Math.round(timeMs) };
+    const destination = await availableFrameDestination(relativePath, timeMs, directory); staged = `${destination}.${randomUUID()}.tmp`; await invertFile(jpeg, staged); await fs.rename(staged, destination); staged = null;
+    return { outputPath: destination, name: basename(destination), timeMs: Math.round(timeMs) };
   } finally { await Promise.all([restored, jpeg, staged].filter(Boolean).map((item) => fs.rm(item, { force: true }))); }
 }
 async function explodeJob(job, relativePath, source) {
@@ -307,10 +319,10 @@ export async function frameMetadataForDirectory(directory) {
     return metadata;
   } catch { return null; }
 }
-async function scanFolder(relativeDirectory = '', { includeHidden = false, query = '', filter = 'all', offset = 0, limit = 250 } = {}) {
+async function scanFolder(relativeDirectory = '', { includeHidden = false, query = '', offset = 0, limit = 250 } = {}) {
   const directory = await resolveDirectory(relativeDirectory); const entries = []; const manifest = await readManifest(); const frameMetadata = await frameMetadataForDirectory(directory);
   const directoryEntries = await fs.readdir(directory, { withFileTypes: true }); let matched = 0; let hasMore = false;
-  const total = filter === 'all' && !query ? directoryEntries.filter((entry) => entry.name !== CACHE_DIRECTORY && (includeHidden || !entry.name.startsWith('.')) && (entry.isDirectory() || (entry.isFile() && isConventionalInvertedName(entry.name)))).length : null;
+  const total = !query ? directoryEntries.filter((entry) => entry.name !== CACHE_DIRECTORY && (includeHidden || !entry.name.startsWith('.')) && (entry.isDirectory() || (entry.isFile() && isConventionalInvertedName(entry.name)))).length : null;
   for (const entry of directoryEntries.sort((left, right) => Number(right.isDirectory()) - Number(left.isDirectory()) || left.name.localeCompare(right.name))) {
     if (entry.name === CACHE_DIRECTORY || (!includeHidden && entry.name.startsWith('.'))) continue;
     const source = join(directory, entry.name); const path = relative(openedRoot, source);
@@ -321,7 +333,6 @@ async function scanFolder(relativeDirectory = '', { includeHidden = false, query
     if (!isInvertedMedia(header) && !(textMime && isConventionalInvertedName(entry.name))) continue;
     const restored = xor(header); const detectedMime = detectMime(restored); const mime = detectedMime === 'application/octet-stream' && textMime ? textMime : detectedMime; const info = await fs.stat(source); const frameDurationMs = detectedMime.startsWith('video/') ? videoFrameDurationMs(restored) : null;
     const record = { path, name: entry.name, size: info.size, modified: info.mtimeMs, mime, kind: kindFor(mime), editableText: Boolean(textMime), thumbnail: null, ...(frameDurationMs ? { frameDurationMs } : {}) };
-    if (filter !== 'all' && record.kind !== filter) continue;
     if (matched++ < offset) continue;
     if (entries.length >= limit) { hasMore = true; break; }
     if (record.kind === 'videos') { if (await isCurrentThumbnail(path, source, manifest)) record.thumbnail = `/api/thumbnail?path=${encodeURIComponent(path)}`; else { record.thumbnail = 'pending'; void thumbnailJob(path, source); } }
@@ -343,6 +354,20 @@ async function readJson(request) { let body = ''; for await (const chunk of requ
 export function validateFolderName(name) {
   if (typeof name !== 'string' || !name || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) throw new Error('Provide a single folder name.');
   return name;
+}
+export function validateRenameName(name) {
+  if (typeof name !== 'string' || !name || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) throw new Error('Provide a single item name.');
+  return name;
+}
+async function renameEntry(path, requestedName) {
+  const { source, info } = await resolveManagedEntry(path); const name = validateRenameName(requestedName);
+  if (!info.isFile() && !info.isDirectory()) throw new Error('Only files and folders can be renamed.');
+  const storedName = info.isDirectory() ? name : invertedName(name); const destination = join(dirname(source), storedName);
+  resolveOpenedPath(relative(openedRoot, destination));
+  if (destination === source) return { path: relative(openedRoot, destination), name: storedName };
+  try { await fs.lstat(destination); throw new Error(`An item already exists with that name: ${storedName}`); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+  await fs.rename(source, destination);
+  return { path: relative(openedRoot, destination), name: storedName };
 }
 async function moveEntries(paths, destinationPath) {
   if (!Array.isArray(paths) || !paths.length) throw new Error('Select at least one item to move.');
@@ -377,14 +402,15 @@ async function serveRestored(request, response, source, mime, filename) {
 }
 async function handleRequest(request, response) {
   const url = new URL(request.url || '/', `http://${request.headers.host || '127.0.0.1'}`); const path = url.pathname;
-    if (request.method === 'POST' && path === '/api/open') { const body = await readJson(request); const candidate = resolve(String(body.path || '')); const info = await fs.stat(candidate); if (!info.isDirectory()) throw new Error('The supplied path is not a directory.'); openedRoot = candidate; const catalog = await scanFolder('', { includeHidden: Boolean(body.showHidden), query: String(body.query || '').toLowerCase(), filter: String(body.filter || 'all') }); return sendJson(response, 200, { root: openedRoot, directory: '', parentListable: await hasListableParent(openedRoot), ...catalog }); }
-    if (request.method === 'GET' && path === '/api/catalog') { const directory = url.searchParams.get('path') || ''; const current = await resolveDirectory(directory); const catalog = await scanFolder(directory, { includeHidden: url.searchParams.get('hidden') === '1', query: (url.searchParams.get('query') || '').toLowerCase(), filter: url.searchParams.get('filter') || 'all', offset: Math.max(0, Number(url.searchParams.get('offset') || 0) || 0), limit: 250 }); return sendJson(response, 200, { root: openedRoot, directory, parentListable: await hasListableParent(current), ...catalog }); }
+    if (request.method === 'POST' && path === '/api/open') { const body = await readJson(request); const candidate = resolve(String(body.path || '')); const info = await fs.stat(candidate); if (!info.isDirectory()) throw new Error('The supplied path is not a directory.'); openedRoot = candidate; const catalog = await scanFolder('', { includeHidden: Boolean(body.showHidden), query: String(body.query || '').toLowerCase() }); return sendJson(response, 200, { root: openedRoot, directory: '', parentListable: await hasListableParent(openedRoot), ...catalog }); }
+    if (request.method === 'GET' && path === '/api/catalog') { const directory = url.searchParams.get('path') || ''; const current = await resolveDirectory(directory); const catalog = await scanFolder(directory, { includeHidden: url.searchParams.get('hidden') === '1', query: (url.searchParams.get('query') || '').toLowerCase(), offset: Math.max(0, Number(url.searchParams.get('offset') || 0) || 0), limit: 250 }); return sendJson(response, 200, { root: openedRoot, directory, parentListable: await hasListableParent(current), ...catalog }); }
     if (request.method === 'GET' && path === '/api/jobs') return sendJson(response, 200, [...jobs.values()]);
     if (request.method === 'POST' && path === '/api/folders') { const body = await readJson(request); const directory = await resolveDirectory(body.directory || ''); await fs.mkdir(join(directory, validateFolderName(body.name))); return sendJson(response, 201, { ok: true }); }
+    if (request.method === 'POST' && path === '/api/files/rename') { const body = await readJson(request); return sendJson(response, 200, await renameEntry(body.path, body.name)); }
     if (request.method === 'POST' && path === '/api/files/move') { const body = await readJson(request); await moveEntries(body.paths, body.destination); return sendJson(response, 200, { ok: true }); }
     if (request.method === 'DELETE' && path === '/api/files') { const body = await readJson(request); await deleteEntries(body.paths); return sendJson(response, 200, { ok: true }); }
     if (request.method === 'POST' && path === '/api/videos/explode') { const body = await readJson(request); const source = resolveSource(body.path); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be exploded.'); const job = createJob('frames', body.path); void explodeJob(job, body.path, source); return sendJson(response, 202, job); }
-    if (request.method === 'POST' && path === '/api/videos/frame') { const body = await readJson(request); const relativePath = String(body.path || ''); const timeMs = Number(body.timeMs); if (!Number.isFinite(timeMs) || timeMs < 0) throw new Error('A valid video time is required.'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide frames.'); return sendJson(response, 201, await extractVideoFrame(relativePath, source, timeMs)); }
+    if (request.method === 'POST' && path === '/api/videos/frame') { const body = await readJson(request); const relativePath = String(body.path || ''); const timeMs = Number(body.timeMs); if (!Number.isFinite(timeMs) || timeMs < 0) throw new Error('A valid video time is required.'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide frames.'); const directory = await resolveFrameOutputDirectory(body.outputDirectory, source); return sendJson(response, 201, await extractVideoFrame(relativePath, source, timeMs, directory)); }
     if (request.method === 'POST' && path === '/api/videos/playback') { const body = await readJson(request); const relativePath = String(body.path || ''); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be prepared for playback.'); if (await currentPlaybackPath(relativePath, source)) return sendJson(response, 200, { status: 'ready', url: `/api/videos/playback?path=${encodeURIComponent(relativePath)}` }); const active = activePlaybackJob(relativePath); if (active) return sendJson(response, 202, { status: 'preparing', job: active }); const job = createJob('playback', relativePath); void playbackJob(job, relativePath, source); return sendJson(response, 202, { status: 'preparing', job }); }
     if (request.method === 'GET' && path === '/api/videos/playback') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const playback = await currentPlaybackPath(relativePath, source); if (!playback) throw new Error('A compatible playback copy is not ready.'); const sourceName = restoredName(basename(relativePath)); const filename = `${basename(sourceName, extname(sourceName)) || 'video'}.mp4`; return serveRestored(request, response, playback, 'video/mp4', filename); }
     if (request.method === 'GET' && path === '/api/media') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); return serveRestored(request, response, source, mime, restoredName(basename(source))); }

@@ -6,7 +6,7 @@ import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, isConventionalInvertedName, isInvertedMedia, isWatchableChange, rangeFor, restoredName, restoredText, saveRestoredText, server, textMimeFor, validateFolderName, videoFrameDurationMs, watchDirectoryChanges, xor } from '../server.mjs';
+import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, invertedName, isConventionalInvertedName, isInvertedMedia, isWatchableChange, rangeFor, restoredName, restoredText, saveRestoredText, server, textMimeFor, validateFolderName, validateRenameName, videoFrameDurationMs, watchDirectoryChanges, xor } from '../server.mjs';
 
 async function waitFor(check, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -54,7 +54,7 @@ test('AVI frame timing is read from its main header', () => {
 });
 
 test('aborted media streams stay available and legacy video gains cached compatible playback', { timeout: 30_000 }, async () => {
-  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-playback-')); const plain = join(directory, 'clip.avi'); const source = join(directory, 'clip.inv.avi'); const prepared = join(directory, 'prepared.mp4');
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-playback-')); const frameOutput = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-captures-')); const plain = join(directory, 'clip.avi'); const source = join(directory, 'clip.inv.avi'); const prepared = join(directory, 'prepared.mp4');
   try {
     const generated = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc=size=64x48:rate=10', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '1', '-c:v', 'mpeg4', '-c:a', 'mp3', plain]);
     assert.equal(generated.status, 0, generated.stderr?.toString());
@@ -73,12 +73,14 @@ test('aborted media streams stay available and legacy video gains cached compati
     const range = await fetch(`${base}/api/videos/playback?path=${encodeURIComponent('clip.inv.avi')}`, { headers: { range: 'bytes=0-31' } }); const rangeBytes = Buffer.from(await range.arrayBuffer()); assert.equal(range.status, 206); assert.equal(range.headers.get('content-type'), 'video/mp4'); assert.equal(rangeBytes.length, 32); assert.equal(rangeBytes.subarray(4, 8).toString('ascii'), 'ftyp');
     const complete = await fetch(`${base}/api/videos/playback?path=${encodeURIComponent('clip.inv.avi')}`); await fs.writeFile(prepared, Buffer.from(await complete.arrayBuffer())); const probed = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_name,codec_type', '-of', 'json', prepared]); assert.equal(probed.status, 0, probed.stderr?.toString()); const streams = JSON.parse(probed.stdout.toString()).streams; assert(streams.some((stream) => stream.codec_type === 'video' && stream.codec_name === 'h264')); assert(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
     const manifest = JSON.parse(await fs.readFile(join(directory, '.inv-cache', 'manifest.json'), 'utf8')); const cached = await fs.readFile(manifest.files['clip.inv.avi'].playback); assert.equal(detectMime(cached), 'application/octet-stream'); assert.equal(detectMime(xor(cached.subarray(0, 32))), 'video/mp4');
-    const extractedResponse = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 500 }) }); const extracted = await extractedResponse.json(); assert.equal(extractedResponse.status, 201); assert.match(extracted.name, /^clip\.frame-000000500\.inv\.jpg$/); const extractedBytes = await fs.readFile(join(directory, extracted.name)); assert.equal(detectMime(extractedBytes), 'application/octet-stream'); assert.equal(detectMime(xor(extractedBytes)), 'image/jpeg');
+    const extractedResponse = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 500 }) }); const extracted = await extractedResponse.json(); assert.equal(extractedResponse.status, 201); assert.match(extracted.name, /^clip\.frame-000000500\.inv\.jpg$/); assert.equal(extracted.outputPath, join(directory, extracted.name)); const extractedBytes = await fs.readFile(extracted.outputPath); assert.equal(detectMime(extractedBytes), 'application/octet-stream'); assert.equal(detectMime(xor(extractedBytes)), 'image/jpeg');
+    await fs.writeFile(join(frameOutput, 'clip.frame-000000600.inv.jpg'), Buffer.from('existing')); const configuredResponse = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 600, outputDirectory: frameOutput }) }); const configured = await configuredResponse.json(); assert.equal(configuredResponse.status, 201); assert.equal(configured.name, 'clip.frame-000000600-2.inv.jpg'); assert.equal(configured.outputPath, join(frameOutput, configured.name)); assert.equal(detectMime(xor(await fs.readFile(configured.outputPath))), 'image/jpeg');
+    for (const outputDirectory of ['relative/path', join(frameOutput, 'missing'), prepared]) { const invalid = await fetch(`${base}/api/videos/frame`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi', timeMs: 700, outputDirectory }) }); assert.equal(invalid.status, 400); }
     const sourceInfo = await fs.stat(source); await fs.utimes(source, sourceInfo.atime, new Date(sourceInfo.mtimeMs + 2_000)); const invalidated = await fetch(`${base}/api/videos/playback`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'clip.inv.avi' }) }); const replacement = await invalidated.json(); assert.equal(invalidated.status, 202); assert.notEqual(replacement.job.id, first.job.id);
     const replacementDeadline = Date.now() + 20_000; let replacementJob; while (!replacementJob || (replacementJob.status !== 'complete' && replacementJob.status !== 'failed')) { if (Date.now() >= replacementDeadline) throw new Error(`Timed out waiting for replacement playback preparation: ${replacementJob?.error || 'no job result'}`); const snapshot = await (await fetch(`${base}/api/jobs`)).json(); replacementJob = snapshot.find((job) => job.id === replacement.job.id); await new Promise((resolveWait) => setTimeout(resolveWait, 25)); } assert.equal(replacementJob.status, 'complete', replacementJob.error);
   } finally {
     if (server.listening) await new Promise((resolveClose) => server.close(resolveClose));
-    await fs.rm(directory, { recursive: true, force: true });
+    await Promise.all([directory, frameOutput].map((item) => fs.rm(item, { recursive: true, force: true })));
   }
 });
 
@@ -130,6 +132,37 @@ test('new folder names cannot escape the current directory', () => {
   assert.equal(validateFolderName('new folder'), 'new folder');
   assert.throws(() => validateFolderName('../outside'), /single folder name/);
   assert.throws(() => validateFolderName('nested/path'), /single folder name/);
+});
+
+test('friendly renamed file names retain their inverted storage marker', () => {
+  assert.equal(invertedName('notes.txt'), 'notes.inv.txt');
+  assert.equal(invertedName('archive'), 'archive.inv');
+  assert.equal(invertedName('release.notes.md'), 'release.notes.inv.md');
+  assert.equal(invertedName('literal.inv.txt'), 'literal.inv.inv.txt');
+  assert.equal(invertedName('trailing.'), 'trailing..inv');
+  assert.equal(validateRenameName('new name.txt'), 'new name.txt');
+  for (const name of ['', '.', '..', '../outside', 'nested/path', 'nested\\path', 'bad\0name']) assert.throws(() => validateRenameName(name), /single item name/);
+});
+
+test('rename API renames files and folders without overwriting existing entries', async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-rename-'));
+  try {
+    await fs.writeFile(join(directory, 'notes.inv.txt'), xor(Buffer.from('notes'))); await fs.mkdir(join(directory, 'drafts'));
+    server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); assert(address && typeof address === 'object'); const base = `http://127.0.0.1:${address.port}`;
+    const request = (path, name) => fetch(`${base}/api/files/rename`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path, name }) });
+    assert.equal((await fetch(`${base}/api/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: directory }) })).status, 200);
+
+    const fileResponse = await request('notes.inv.txt', 'renamed.md'); assert.equal(fileResponse.status, 200); assert.deepEqual(await fileResponse.json(), { path: 'renamed.inv.md', name: 'renamed.inv.md' });
+    assert.equal(await restoredText(join(directory, 'renamed.inv.md')), 'notes'); await assert.rejects(fs.stat(join(directory, 'notes.inv.txt')));
+    const catalog = await (await fetch(`${base}/api/catalog`)).json(); assert(catalog.files.some((entry) => entry.path === 'renamed.inv.md' && entry.name === 'renamed.inv.md'));
+    const folderResponse = await request('drafts', 'finished'); assert.equal(folderResponse.status, 200); assert.deepEqual(await folderResponse.json(), { path: 'finished', name: 'finished' }); assert((await fs.stat(join(directory, 'finished'))).isDirectory());
+
+    await fs.writeFile(join(directory, 'collision.inv.md'), xor(Buffer.from('collision'))); const conflict = await request('renamed.inv.md', 'collision.md'); assert.equal(conflict.status, 400); assert.match((await conflict.json()).error, /already exists/);
+    assert.equal(await restoredText(join(directory, 'renamed.inv.md')), 'notes'); assert.equal((await request('renamed.inv.md', '../outside.md')).status, 400); assert.equal((await request('finished', '.inv-cache')).status, 400);
+  } finally {
+    if (server.listening) await new Promise((resolveClose) => server.close(resolveClose));
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('cache activity is excluded from source directory notifications', () => {

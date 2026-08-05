@@ -56,10 +56,14 @@ Large directories are loaded in pages of 250 entries. Use the paging controls
 at the bottom of the browser to move between pages without waiting for the
 entire directory to be scanned or rendered at once.
 
+The sidebar contains application configuration. **Extracted frame directory**
+accepts an absolute path and is remembered by the browser. Leave it blank to
+save single-frame captures beside their source video.
+
 The displayed directory updates live when eligible inverted files or folders
 are created, modified, renamed, or deleted. Each browser tab watches only its
 current directory and changes the subscription when navigating. The catalog
-keeps its active search, filter, sort, and page settings; an open full media or
+keeps its active search, sort, and page settings; an open full media or
 text viewer is left undisturbed until you return to the catalog. WebSocket
 reconnection performs a fresh catalog read, and periodic HTTP refreshes act as
 a fallback while live watching is unavailable.
@@ -69,7 +73,10 @@ Shift-click to select a visible range. Press Escape or use **Clear** to clear a
 selection. Double click opens an item. The action controls create a folder,
 move selected items, or delete them after confirmation; selected items can also
 be dragged onto a directory to move them. Moves never overwrite an existing
-destination item. Selecting a file shows its complete source path in the path
+destination item. Right-click any file or folder to open it, copy its full path,
+rename it, or delete it;
+file names are shown without their on-disk `.inv` marker, which is preserved automatically.
+Selecting a file shows its complete source path in the path
 field and breadcrumbs; use **Copy** beside the field to copy it. The preview
 pane can be resized by dragging its left edge;
 the chosen width is remembered by the browser. File actions, view controls, and
@@ -103,8 +110,9 @@ download always returns the original restored format, not the cached derivative.
 The full video player includes previous-frame and next-frame buttons. AVI files
 use their declared frame interval; other containers fall back to a 30 fps step.
 **Extract current frame** pauses at the displayed time and writes an inverted
-JPEG beside the source with a timestamped name such as
-`fight.frame-000042123.inv.jpg`. Existing captures are never overwritten.
+JPEG to the configured extracted-frame directory with a timestamped name such
+as `fight.frame-000042123.inv.jpg`. When the setting is blank, the frame is
+written beside its source. Existing captures are never overwritten.
 
 Right-click a video card and choose **Explode into frames** to export every
 decoded frame. Inverted JPEGs are placed beside the source video in a visible
