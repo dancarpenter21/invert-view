@@ -34,11 +34,10 @@ export const xor = (buffer) => {
   return result;
 };
 
-export function restoredName(name) { return name.replace(/\.inv(?=\.[^.]+$|$)/i, ''); }
+export function restoredName(name) { return name.replace(/\.inv$/i, ''); }
 
 export function invertedName(name) {
-  const extension = extname(name);
-  return extension.length > 1 ? `${name.slice(0, -extension.length)}.inv${extension}` : `${name}.inv`;
+  return `${name}.inv`;
 }
 
 export function detectMime(header) {
@@ -94,7 +93,7 @@ export function watchDirectoryChanges(directory, onChange, { debounceMs = WATCH_
 }
 
 export function textMimeFor(name) { return TEXT_MIME_BY_EXTENSION.get(extname(restoredName(name)).toLowerCase()) || null; }
-export function isConventionalInvertedName(name) { return /\.inv(?=\.[^.]+$|$)/i.test(name); }
+export function isConventionalInvertedName(name) { return /\.inv$/i.test(name); }
 
 function kindFor(mime) { return mime.startsWith('image/') ? 'images' : mime.startsWith('video/') ? 'videos' : 'other'; }
 function cacheRoot() { return join(openedRoot, CACHE_DIRECTORY); }
@@ -130,14 +129,14 @@ function stemFor(relativePath) { return basename(restoredName(relativePath), ext
 export function frameDirectoryName(relativePath) { return `${basename(relativePath)}.frames`; }
 export function frameTimeRangeFor(durationMs, frameCount, names) {
   if (!Number.isFinite(durationMs) || durationMs <= 0 || !Number.isSafeInteger(frameCount) || frameCount <= 0 || !Array.isArray(names)) return null;
-  const frameNumbers = names.map((name) => /^(\d{6,})\.inv\.jpg$/i.exec(name)?.[1]).filter(Boolean).map(Number).filter((number) => Number.isSafeInteger(number) && number >= 1 && number <= frameCount);
+  const frameNumbers = names.map((name) => /^(\d{6,})\.jpg\.inv$/i.exec(name)?.[1]).filter(Boolean).map(Number).filter((number) => Number.isSafeInteger(number) && number >= 1 && number <= frameCount);
   if (!frameNumbers.length) return null;
   const firstFrame = Math.min(...frameNumbers); const lastFrame = Math.max(...frameNumbers);
   return { startMs: Math.max(0, durationMs * (firstFrame - 1) / frameCount), endMs: Math.min(durationMs, durationMs * lastFrame / frameCount) };
 }
 function artifactPaths(relativePath) {
   const id = `${stemFor(relativePath)}-${keyFor(relativePath)}`;
-  return { thumbnail: join(cacheRoot(), THUMBNAIL_DIRECTORY, `${id}.thumb.inv.jpg`), playback: join(cacheRoot(), PLAYBACK_DIRECTORY, `${id}.playback.inv.mp4`), frames: join(openedRoot, dirname(relativePath), frameDirectoryName(relativePath)) };
+  return { thumbnail: join(cacheRoot(), THUMBNAIL_DIRECTORY, `${id}.thumb.jpg.inv`), playback: join(cacheRoot(), PLAYBACK_DIRECTORY, `${id}.playback.mp4.inv`), frames: join(openedRoot, dirname(relativePath), frameDirectoryName(relativePath)) };
 }
 async function readManifest() {
   try { return JSON.parse(await fs.readFile(join(cacheRoot(), 'manifest.json'), 'utf8')); } catch { return { version: 1, files: {} }; }
@@ -284,7 +283,7 @@ async function resolveVideoOutputDirectory(value, source) { return resolveOutput
 async function availableFrameDestination(relativePath, timeMs, directory) {
   const stem = stemFor(relativePath); const timestamp = String(Math.round(timeMs)).padStart(9, '0');
   for (let copy = 1; ; copy += 1) {
-    const suffix = copy === 1 ? '' : `-${copy}`; const destination = join(directory, `${stem}.frame-${timestamp}${suffix}.inv.jpg`);
+    const suffix = copy === 1 ? '' : `-${copy}`; const destination = join(directory, `${stem}.frame-${timestamp}${suffix}.jpg.inv`);
     try { await fs.lstat(destination); } catch (error) { if (error?.code === 'ENOENT') return destination; throw error; }
   }
 }
@@ -299,7 +298,7 @@ async function extractVideoFrame(relativePath, source, timeMs, directory) {
 }
 function segmentName(relativePath, startMs, endMs, copy = 1) {
   const start = String(Math.round(startMs)).padStart(9, '0'); const end = String(Math.round(endMs)).padStart(9, '0'); const suffix = copy === 1 ? '' : `-${copy}`;
-  return `${stemFor(relativePath)}.segment-${start}-${end}${suffix}.inv.mp4`;
+  return `${stemFor(relativePath)}.segment-${start}-${end}${suffix}.mp4.inv`;
 }
 async function commitSegment(staged, relativePath, startMs, endMs, directory) {
   for (let copy = 1; ; copy += 1) {
@@ -336,7 +335,7 @@ async function explodeJob(job, relativePath, source) {
     const observedDurationMs = await runFfmpeg(['-i', restored, '-q:v', '2', join(work, '%06d.jpg')], job);
     const generated = (await fs.readdir(work)).filter((name) => name.endsWith('.jpg')).sort(); if (!generated.length) throw new Error('ffmpeg produced no frames.');
     staged = `${paths.frames}.${randomUUID()}.tmp`; await fs.mkdir(staged, { recursive: true });
-    for (const name of generated) await invertFile(join(work, name), join(staged, name.replace(/\.jpg$/i, '.inv.jpg')));
+    for (const name of generated) await invertFile(join(work, name), join(staged, `${name}.inv`));
     const fingerprint = await fileFingerprint(source); const durationMs = Number.isFinite(job.durationMs) && job.durationMs > 0 ? job.durationMs : observedDurationMs > 0 ? observedDurationMs : null;
     const frameMetadata = { version: 1, sourceName: basename(relativePath), sourceSize: fingerprint.size, sourceModifiedMs: fingerprint.modifiedMs, durationMs, frameCount: generated.length, firstFrameNumber: 1 };
     try { await fs.writeFile(join(staged, FRAME_METADATA_FILE), `${JSON.stringify(frameMetadata, null, 2)}\n`); } catch { /* Timing metadata is optional; keep the extracted frames. */ }

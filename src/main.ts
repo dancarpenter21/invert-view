@@ -18,7 +18,7 @@ const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('App root is missing.');
 const state = { files: [] as CatalogEntry[], selected: null as CatalogFile | null, selectedPaths: new Set<string>(), selectionAnchor: '' as string, query: '', sortOrder: 'ascending' as SortOrder, view: 'detailed' as ViewMode, showHidden: false, previewVisible: false, root: '', directory: '', parentListable: false, hasMore: false, page: 0, total: null as number | null, frameTimeRange: null as FrameTimeRange | null, loadingPage: null as number | null, jobs: [] as Job[], screen: 'catalog' as 'catalog' | 'viewer', textContent: '', textDirty: false, catalogDirty: false, frameOutputDirectory: '', videoOutputDirectory: '' };
 const urlFor = (route: string) => route;
-const restoredName = (name: string) => name.replace(/\.inv(?=\.[^.]+$|$)/i, '');
+const restoredName = (name: string) => name.replace(/\.inv$/i, '');
 const mediaUrl = (file: CatalogFile) => urlFor(`/api/media?path=${encodeURIComponent(file.path)}`);
 const playbackUrl = (file: CatalogFile) => urlFor(`/api/videos/playback?path=${encodeURIComponent(file.path)}`);
 const formatSize = (bytes: number) => bytes < 1024 ** 2 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 ** 2).toFixed(bytes > 100 * 1024 ** 2 ? 0 : 1)} MB`;

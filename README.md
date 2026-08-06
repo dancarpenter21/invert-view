@@ -105,7 +105,7 @@ Then open `http://127.0.0.1:4174`.
 
 When the service detects an inverted video, it creates a thumbnail in the
 opened folder's `.inv-cache/thumbnails/` directory. The thumbnail itself is an
-inverted JPEG ending in `.inv.jpg`; no plain thumbnail is retained. Cache
+inverted JPEG ending in `.jpg.inv`; no plain thumbnail is retained. Cache
 metadata in `.inv-cache/manifest.json` records the source size and modification
 time, so a thumbnail is regenerated only when its source changes.
 
@@ -121,7 +121,7 @@ The full video player includes previous-frame and next-frame buttons. AVI files
 use their declared frame interval; other containers fall back to a 30 fps step.
 **Extract current frame** pauses at the displayed time and writes an inverted
 JPEG to the configured extracted-frame directory with a timestamped name such
-as `fight.frame-000042123.inv.jpg`. When the setting is blank, the frame is
+as `fight.frame-000042123.jpg.inv`. When the setting is blank, the frame is
 written beside its source. Existing captures are never overwritten.
 
 The trim strip below the player exports one contiguous video segment. Set In
@@ -129,13 +129,13 @@ and Out from the current playhead, drag either range handle, or enter exact
 `HH:MM:SS.mmm` timestamps. **Preview segment** plays only the selected range,
 and **Extract segment** queues a background H.264/AAC MP4 transcode. The result
 is inverted and saved to the configured extracted-video directory with a name
-such as `fight.segment-000002000-000008500.inv.mp4`; collisions receive a
+such as `fight.segment-000002000-000008500.mp4.inv`; collisions receive a
 numeric suffix. The source remains unchanged and plain temporary files are
 removed after success or failure.
 
 Right-click a video card and choose **Explode into frames** to export every
 decoded frame. Inverted JPEGs are placed beside the source video in a visible
-directory named `<video>.frames/` (for example, `fight.inv.mp4.frames/`). The
+directory named `<video>.frames/` (for example, `fight.mp4.inv.frames/`). The
 extraction runs in the background; the viewer remains usable and reports its
 status in a persistent progress popup. Job changes stream to the browser over a
 local WebSocket, with periodic HTTP polling as a fallback. Plain restored videos
