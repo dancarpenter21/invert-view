@@ -397,6 +397,12 @@ export function validateRenameName(name) {
   if (typeof name !== 'string' || !name || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || name.includes('\0')) throw new Error('Provide a single item name.');
   return name;
 }
+async function createFile(directoryPath, requestedName) {
+  const directory = await resolveDirectory(directoryPath || ''); const name = validateRenameName(requestedName); const storedName = invertedName(name); const destination = join(directory, storedName);
+  try { await fs.writeFile(destination, Buffer.alloc(0), { flag: 'wx' }); }
+  catch (error) { if (error?.code === 'EEXIST') throw new Error(`An item already exists with that name: ${storedName}`); throw error; }
+  return { path: relative(openedRoot, destination), name: storedName };
+}
 async function renameEntry(path, requestedName) {
   const { source, info } = await resolveManagedEntry(path); const name = validateRenameName(requestedName);
   if (!info.isFile() && !info.isDirectory()) throw new Error('Only files and folders can be renamed.');
@@ -450,6 +456,7 @@ async function handleRequest(request, response) {
     if (request.method === 'GET' && path === '/api/catalog') { const directory = url.searchParams.get('path') || ''; const current = await resolveDirectory(directory); const catalog = await scanFolder(directory, { includeHidden: url.searchParams.get('hidden') === '1', query: (url.searchParams.get('query') || '').toLowerCase(), offset: Math.max(0, Number(url.searchParams.get('offset') || 0) || 0), limit: 250 }); return sendJson(response, 200, { root: openedRoot, directory, parentListable: await hasListableParent(current), ...catalog }); }
     if (request.method === 'GET' && path === '/api/jobs') return sendJson(response, 200, [...jobs.values()]);
     if (request.method === 'POST' && path === '/api/folders') { const body = await readJson(request); const directory = await resolveDirectory(body.directory || ''); await fs.mkdir(join(directory, validateFolderName(body.name))); return sendJson(response, 201, { ok: true }); }
+    if (request.method === 'POST' && path === '/api/files') { const body = await readJson(request); return sendJson(response, 201, await createFile(body.directory, body.name)); }
     if (request.method === 'POST' && path === '/api/files/rename') { const body = await readJson(request); return sendJson(response, 200, await renameEntry(body.path, body.name)); }
     if (request.method === 'POST' && path === '/api/files/move') { const body = await readJson(request); await moveEntries(body.paths, body.destination); return sendJson(response, 200, { ok: true }); }
     if (request.method === 'DELETE' && path === '/api/files') { const body = await readJson(request); await deleteEntries(body.paths); return sendJson(response, 200, { ok: true }); }

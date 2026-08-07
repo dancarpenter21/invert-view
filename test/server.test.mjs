@@ -141,6 +141,18 @@ test('new folder names cannot escape the current directory', () => {
   assert.throws(() => validateFolderName('nested/path'), /single folder name/);
 });
 
+test('file creation API creates an empty inverted file without overwriting', async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-create-file-'));
+  try {
+    await fs.mkdir(join(directory, 'drafts')); server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); assert(address && typeof address === 'object'); const base = `http://127.0.0.1:${address.port}`;
+    assert.equal((await fetch(`${base}/api/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: directory }) })).status, 200);
+    const create = (name, target = '') => fetch(`${base}/api/files`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ directory: target, name }) });
+    const response = await create('notes.md', 'drafts'); assert.equal(response.status, 201); assert.deepEqual(await response.json(), { path: join('drafts', 'notes.md.inv'), name: 'notes.md.inv' }); assert.equal((await fs.stat(join(directory, 'drafts', 'notes.md.inv'))).size, 0);
+    const catalog = await (await fetch(`${base}/api/catalog?path=drafts`)).json(); assert(catalog.files.some((entry) => entry.path === join('drafts', 'notes.md.inv') && entry.editableText));
+    assert.equal((await create('notes.md', 'drafts')).status, 400); assert.equal((await create('../outside.md', 'drafts')).status, 400); assert.equal((await fs.stat(join(directory, 'drafts', 'notes.md.inv'))).size, 0);
+  } finally { if (server.listening) await new Promise((resolveClose) => server.close(resolveClose)); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
 test('friendly renamed file names retain their inverted storage marker', () => {
   assert.equal(invertedName('notes.txt'), 'notes.txt.inv');
   assert.equal(invertedName('archive'), 'archive.inv');

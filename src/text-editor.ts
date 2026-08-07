@@ -12,6 +12,7 @@ type EditorOptions = {
   container: HTMLElement;
   content: string;
   fileName: string;
+  filePath: string;
   mime: string;
   onChange: (content: string) => void;
   onSave: () => void;
@@ -19,6 +20,21 @@ type EditorOptions = {
 };
 
 const extensionFor = (name: string) => name.toLowerCase().split('.').at(-1) || '';
+
+function markdownImageUrl(documentPath: string, reference: string): string | null {
+  let referencedPath: string;
+  try { referencedPath = decodeURIComponent(reference.split(/[?#]/, 1)[0]); }
+  catch { return null; }
+  if (!referencedPath || referencedPath.includes('\0')) return null;
+  const segments = referencedPath.startsWith('/') ? [] : documentPath.split('/').slice(0, -1);
+  for (const segment of referencedPath.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') { if (!segments.length) return null; segments.pop(); }
+    else segments.push(segment);
+  }
+  let path = segments.join('/'); if (!/\.inv$/i.test(path)) path += '.inv';
+  return `/api/media?path=${encodeURIComponent(path)}`;
+}
 
 async function languageFor(fileName: string, mime: string): Promise<Extension[]> {
   const extension = extensionFor(fileName);
@@ -56,8 +72,10 @@ export async function createIntegratedTextEditor(options: EditorOptions): Promis
   async function renderPreview(): Promise<void> {
     const preview = options.container.querySelector<HTMLElement>('.markdown-preview'); if (!preview) return; const version = ++previewVersion; preview.setAttribute('aria-busy', 'true');
     try {
-      const [{ marked }, { default: DOMPurify }] = await Promise.all([import('marked'), import('dompurify')]); const rendered = await marked.parse(view.state.doc.toString().replace(/^[\u200B-\u200F\uFEFF]/, ''), { gfm: true }); if (version !== previewVersion) return; preview.innerHTML = DOMPurify.sanitize(rendered, { USE_PROFILES: { html: true } });
-      preview.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((link) => { const href = link.getAttribute('href') || ''; if (/^(?:https?:|mailto:)/i.test(href)) { link.target = '_blank'; link.rel = 'noopener noreferrer'; } });
+      const [{ marked }, { default: DOMPurify }] = await Promise.all([import('marked'), import('dompurify')]); const rendered = await marked.parse(view.state.doc.toString().replace(/^[\u200B-\u200F\uFEFF]/, ''), { gfm: true }); if (version !== previewVersion) return; const sanitized = DOMPurify.sanitize(rendered, { USE_PROFILES: { html: true }, RETURN_DOM_FRAGMENT: true });
+      sanitized.querySelectorAll<HTMLImageElement>('img[src]').forEach((image) => { const source = image.getAttribute('src') || ''; if (!source || source.startsWith('//') || /^[a-z][a-z\d+.-]*:/i.test(source)) return; const url = markdownImageUrl(options.filePath, source); if (url) image.src = url; else image.removeAttribute('src'); });
+      sanitized.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((link) => { const href = link.getAttribute('href') || ''; if (/^(?:https?:|mailto:)/i.test(href)) { link.target = '_blank'; link.rel = 'noopener noreferrer'; } });
+      preview.replaceChildren(sanitized);
     } catch (error) { if (version === previewVersion) preview.textContent = error instanceof Error ? `Preview failed: ${error.message}` : 'Preview failed.'; }
     finally { if (version === previewVersion) preview.removeAttribute('aria-busy'); }
   }
