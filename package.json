@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "VITE_DEFAULT_FOLDER=\"${RAILROAD_LOGISTICS_DEFAULT_FOLDER:-/home/danc/.diadev/docs}\" sh -c 'node server.mjs & api_pid=$!; vite --host 127.0.0.1; status=$?; kill $api_pid 2>/dev/null; wait $api_pid 2>/dev/null; exit $status'",
+    "dev": "VITE_DEFAULT_FOLDER=\"${RAILROAD_LOGISTICS_DEFAULT_FOLDER:-/home/danc/.diadev/docs}\" sh -c 'node --watch --watch-preserve-output server.mjs & api_pid=$!; vite --host 127.0.0.1; status=$?; kill $api_pid 2>/dev/null; wait $api_pid 2>/dev/null; exit $status'",
     "build": "tsc -b && vite build",
     "start": "node server.mjs",
     "preview": "vite preview",

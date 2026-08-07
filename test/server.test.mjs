@@ -6,7 +6,8 @@ import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, invertedName, isConventionalInvertedName, isInvertedMedia, isWatchableChange, rangeFor, restoredName, restoredText, saveRestoredText, server, textMimeFor, validateFolderName, validateRenameName, videoFrameDurationMs, watchDirectoryChanges, xor } from '../server.mjs';
+import { WebSocket } from 'ws';
+import { detectMime, frameDirectoryName, frameMetadataForDirectory, frameTimeRangeFor, invertedName, isConventionalInvertedName, isInvertedMedia, isWatchableChange, permissionMode, rangeFor, restoredName, restoredText, saveRestoredText, server, textMimeFor, validateFolderName, validateRenameName, videoFrameDurationMs, watchDirectoryChanges, xor } from '../server.mjs';
 
 async function waitFor(check, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -220,11 +221,27 @@ test('directory watcher reports coalesced create, modify, rename, and delete cha
   try {
     await fs.writeFile(source, Buffer.from('created')); await waitFor(() => changes >= 1);
     await fs.appendFile(source, Buffer.from('modified')); await waitFor(() => changes >= 2);
-    await fs.rename(source, renamed); await waitFor(() => changes >= 3);
-    await fs.rm(renamed); await waitFor(() => changes >= 4);
-    await fs.mkdir(join(directory, '.inv-cache')); await new Promise((resolve) => setTimeout(resolve, 80)); assert.equal(changes, 4);
-    watcher.close(); await fs.writeFile(join(directory, 'after-close.txt.inv'), Buffer.from('ignored')); await new Promise((resolve) => setTimeout(resolve, 80)); assert.equal(changes, 4);
+    await fs.chmod(source, 0o444); await waitFor(() => changes >= 3); await fs.chmod(source, 0o644);
+    await fs.rename(source, renamed); await waitFor(() => changes >= 4);
+    await fs.rm(renamed); await waitFor(() => changes >= 5);
+    await fs.mkdir(join(directory, '.inv-cache')); await new Promise((resolve) => setTimeout(resolve, 80)); assert.equal(changes, 5);
+    watcher.close(); await fs.writeFile(join(directory, 'after-close.txt.inv'), Buffer.from('ignored')); await new Promise((resolve) => setTimeout(resolve, 80)); assert.equal(changes, 5);
   } finally { watcher.close(); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('live websocket reports an atomic external text replacement with a coherent snapshot', async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-live-text-')); const source = join(directory, 'notes.md.inv'); let socket;
+  try {
+    await fs.writeFile(source, xor(Buffer.from('# Original'))); server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); assert(address && typeof address === 'object'); const base = `http://127.0.0.1:${address.port}`;
+    assert.equal((await fetch(`${base}/api/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: directory }) })).status, 200);
+    const messages = []; socket = new WebSocket(`ws://127.0.0.1:${address.port}/api/live`, { origin: base }); socket.on('message', (payload) => messages.push(JSON.parse(String(payload)))); await once(socket, 'open'); socket.send(JSON.stringify({ type: 'watch-directory', root: directory, directory: '' }));
+    await waitFor(() => messages.some((message) => message.type === 'watch-ready')); await waitFor(() => messages.some((message) => message.type === 'catalog-change')); const initialChanges = messages.filter((message) => message.type === 'catalog-change').length;
+    const staged = join(directory, '.notes-agent-write.tmp'); await fs.writeFile(staged, xor(Buffer.from('# Updated by agent\n\nLive content.'))); await fs.rename(staged, source);
+    await waitFor(() => messages.filter((message) => message.type === 'catalog-change').length > initialChanges); const response = await fetch(`${base}/api/text?path=${encodeURIComponent('notes.md.inv')}`); const snapshot = await response.json(); assert.equal(response.status, 200); assert.equal(snapshot.content, '# Updated by agent\n\nLive content.'); assert.equal(snapshot.size, Buffer.byteLength(snapshot.content)); assert(Number.isFinite(snapshot.modified));
+  } finally {
+    if (socket && socket.readyState !== WebSocket.CLOSED) { const closed = once(socket, 'close'); socket.close(); await closed; }
+    if (server.listening) await new Promise((resolveClose) => server.close(resolveClose)); await fs.rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('restored text saves back as an inverted UTF-8 source', async () => {
@@ -255,4 +272,25 @@ test('restored text rejects invalid UTF-8 and content larger than 5 MB', async (
   const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-text-validation-')); const invalid = join(directory, 'invalid.txt.inv'); const oversized = join(directory, 'oversized.txt.inv');
   try { await fs.writeFile(invalid, xor(Buffer.from([0xc3, 0x28]))); await assert.rejects(restoredText(invalid), /valid UTF-8/); await assert.rejects(saveRestoredText(oversized, 'x'.repeat(5 * 1024 * 1024 + 1)), /larger than 5 MB/); }
   finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('permission modes are formatted as four-digit Unix modes', () => {
+  assert.equal(permissionMode({ mode: 0o100644 }), '0644');
+  assert.equal(permissionMode({ mode: 0o100600 }), '0600');
+  assert.equal(permissionMode({ mode: 0o100400 }), '0400');
+  assert.equal(permissionMode({ mode: 0o100500 }), '0500');
+  assert.equal(permissionMode({ mode: 0o40755 }), '0755');
+});
+
+test('catalog and mutations honor content and parent-directory permissions independently', async () => {
+  const directory = await fs.mkdtemp(join(tmpdir(), 'inv-viewer-permissions-')); const source = join(directory, 'locked.md.inv'); const writable = join(directory, 'writable.md.inv'); const executable = join(directory, 'executable.md.inv'); const unreadable = join(directory, 'unreadable.txt.inv');
+  try {
+    await fs.writeFile(source, xor(Buffer.from('# Locked'))); await fs.writeFile(writable, xor(Buffer.from('# Writable'))); await fs.writeFile(executable, xor(Buffer.from('# Executable'))); await fs.writeFile(unreadable, xor(Buffer.from('secret'))); await fs.chmod(source, 0o400); await fs.chmod(writable, 0o600); await fs.chmod(executable, 0o500); await fs.chmod(unreadable, 0o000); server.listen(0, '127.0.0.1'); await once(server, 'listening'); const address = server.address(); assert(address && typeof address === 'object'); const base = `http://127.0.0.1:${address.port}`;
+    const openedResponse = await fetch(`${base}/api/open`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: directory }) }); const opened = await openedResponse.json(); assert.equal(openedResponse.status, 200); const entry = opened.files.find((item) => item.path === 'locked.md.inv'); assert(entry); assert.equal(entry.access.permissions.mode, '0400'); assert.equal(entry.access.capabilities.open, true); assert.equal(entry.access.capabilities.writeContent, false); assert.equal(entry.access.capabilities.rename, true); assert.equal(entry.access.capabilities.move, true); assert.equal(entry.access.capabilities.delete, true); const writableEntry = opened.files.find((item) => item.path === 'writable.md.inv'); assert(writableEntry); assert.equal(writableEntry.access.permissions.mode, '0600'); assert.equal(writableEntry.access.capabilities.writeContent, true); const executableEntry = opened.files.find((item) => item.path === 'executable.md.inv'); assert(executableEntry); assert.equal(executableEntry.access.permissions.mode, '0500'); assert.equal(executableEntry.access.capabilities.writeContent, false); const inaccessibleEntry = opened.files.find((item) => item.path === 'unreadable.txt.inv'); assert(inaccessibleEntry); assert.equal(inaccessibleEntry.mime, 'Unavailable'); assert.equal(inaccessibleEntry.access.permissions.mode, '0000'); assert.equal(inaccessibleEntry.access.capabilities.open, false); assert.equal(opened.directoryAccess.capabilities.createChildren, true);
+    const stale = { path: 'locked.md.inv', content: '# Changed', expectedSize: entry.size, expectedModified: entry.modified }; for (const force of [false, true]) { const response = await fetch(`${base}/api/text`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...stale, force }) }); assert.equal(response.status, 403); assert.match((await response.json()).error, /read-only/); } assert.equal(await restoredText(source), '# Locked');
+    const renamed = await fetch(`${base}/api/files/rename`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: 'locked.md.inv', name: 'still-locked.md' }) }); assert.equal(renamed.status, 200); assert.equal((await renamed.json()).path, 'still-locked.md.inv'); assert.equal((await fs.stat(join(directory, 'still-locked.md.inv'))).mode & 0o777, 0o400);
+    await fs.chmod(directory, 0o555); const createFileResponse = await fetch(`${base}/api/files`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ directory: '', name: 'blocked.txt' }) }); assert.equal(createFileResponse.status, 403); const createFolderResponse = await fetch(`${base}/api/folders`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ directory: '', name: 'blocked' }) }); assert.equal(createFolderResponse.status, 403); const accessResponse = await fetch(`${base}/api/access/directory`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: directory }) }); const access = await accessResponse.json(); assert.equal(accessResponse.status, 200); assert.equal(access.permissions.mode, '0555'); assert.equal(access.capabilities.createChildren, false); const blockedWriteResponse = await fetch(`${base}/api/access?path=writable.md.inv`); const blockedWrite = await blockedWriteResponse.json(); assert.equal(blockedWriteResponse.status, 200); assert.equal(blockedWrite.permissions.mode, '0600'); assert.equal(blockedWrite.capabilities.writeContent, false);
+  } finally {
+    await fs.chmod(directory, 0o755).catch(() => {}); await fs.chmod(unreadable, 0o600).catch(() => {}); if (server.listening) await new Promise((resolveClose) => server.close(resolveClose)); await fs.rm(directory, { recursive: true, force: true });
+  }
 });

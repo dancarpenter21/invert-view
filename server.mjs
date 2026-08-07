@@ -98,6 +98,22 @@ export function isConventionalInvertedName(name) { return /\.inv$/i.test(name); 
 function kindFor(mime) { return mime.startsWith('image/') ? 'images' : mime.startsWith('video/') ? 'videos' : 'other'; }
 function cacheRoot() { return join(openedRoot, CACHE_DIRECTORY); }
 function assertOpened() { if (!openedRoot) throw new Error('Open a local folder first.'); }
+async function hasAccess(path, mode) { try { await fs.access(path, mode); return true; } catch { return false; } }
+export function permissionMode(info) { return (info.mode & 0o7777).toString(8).padStart(4, '0'); }
+async function entryAccess(source, knownInfo = null) {
+  const info = knownInfo || await fs.stat(source); const parent = dirname(source); const [readable, writable, executable, parentMutable] = await Promise.all([
+    hasAccess(source, fsConstants.R_OK), hasAccess(source, fsConstants.W_OK), hasAccess(source, fsConstants.X_OK), hasAccess(parent, fsConstants.W_OK | fsConstants.X_OK),
+  ]);
+  const directory = info.isDirectory(); const createChildren = directory && writable && executable;
+  return { permissions: { mode: permissionMode(info), readable, writable, executable }, capabilities: { open: directory ? readable && executable : readable, writeContent: !directory && writable && parentMutable, rename: parentMutable, move: parentMutable, delete: parentMutable, createChildren, createSibling: parentMutable } };
+}
+async function assertCapability(source, capability, message, knownInfo = null) {
+  const access = await entryAccess(source, knownInfo); if (!access.capabilities[capability]) throw new HttpError(403, message); return access;
+}
+async function canWriteCache() {
+  try { return (await entryAccess(cacheRoot())).capabilities.createChildren; }
+  catch (error) { if (error?.code !== 'ENOENT') return false; return (await entryAccess(openedRoot)).capabilities.createChildren; }
+}
 function resolveOpenedPath(relativePath) {
   assertOpened();
   if (!relativePath || typeof relativePath !== 'string') throw new Error('A file path is required.');
@@ -183,7 +199,7 @@ export async function saveRestoredText(source, content, expected = null, force =
   if (typeof content !== 'string') throw new Error('Text content is required.');
   const restored = Buffer.from(content, 'utf8');
   if (restored.length > MAX_TEXT_BYTES) throw new Error('Text files larger than 5 MB cannot be edited in the browser.');
-  const assertCurrent = async () => { if (!force && expected && !fingerprintMatches(expected, await fileFingerprint(source))) throw new HttpError(409, 'This file changed on disk after it was opened.'); };
+  const assertCurrent = async () => { await assertCapability(source, 'writeContent', 'This file is read-only and cannot be saved.'); if (!force && expected && !fingerprintMatches(expected, await fileFingerprint(source))) throw new HttpError(409, 'This file changed on disk after it was opened.'); };
   const temporary = `${source}.${randomUUID()}.tmp`; await assertCurrent();
   try { await fs.writeFile(temporary, xor(restored)); await assertCurrent(); await fs.rename(temporary, source); }
   finally { await fs.rm(temporary, { force: true }); }
@@ -272,11 +288,10 @@ async function playbackJob(job, relativePath, source) {
   return job;
 }
 async function resolveOutputDirectory(value, source, label) {
-  if (value === undefined || value === null || value === '') return dirname(source);
-  if (typeof value !== 'string' || !isAbsolute(value)) throw new Error(`The ${label} directory must be an absolute path.`);
-  const directory = resolve(value); const info = await fs.stat(directory);
+  if (value !== undefined && value !== null && value !== '' && (typeof value !== 'string' || !isAbsolute(value))) throw new Error(`The ${label} directory must be an absolute path.`);
+  const directory = value === undefined || value === null || value === '' ? dirname(source) : resolve(value); const info = await fs.stat(directory);
   if (!info.isDirectory()) throw new Error(`The ${label} path is not a directory.`);
-  await fs.access(directory, fsConstants.W_OK); return directory;
+  if (!(await entryAccess(directory, info)).capabilities.createChildren) throw new HttpError(403, `The ${label} directory is read-only.`); return directory;
 }
 async function resolveFrameOutputDirectory(value, source) { return resolveOutputDirectory(value, source, 'extracted frame'); }
 async function resolveVideoOutputDirectory(value, source) { return resolveOutputDirectory(value, source, 'extracted video'); }
@@ -358,27 +373,30 @@ export async function frameMetadataForDirectory(directory) {
   } catch { return null; }
 }
 async function scanFolder(relativeDirectory = '', { includeHidden = false, query = '', offset = 0, limit = 250 } = {}) {
-  const directory = await resolveDirectory(relativeDirectory); const entries = []; const manifest = await readManifest(); const frameMetadata = await frameMetadataForDirectory(directory);
+  const directory = await resolveDirectory(relativeDirectory); const entries = []; const manifest = await readManifest(); const frameMetadata = await frameMetadataForDirectory(directory); const directoryAccess = await entryAccess(directory); const parent = dirname(directory); const parentAccess = parent === directory ? null : await entryAccess(parent); const cacheWritable = await canWriteCache();
   const directoryEntries = await fs.readdir(directory, { withFileTypes: true }); let matched = 0; let hasMore = false;
   const total = !query ? directoryEntries.filter((entry) => entry.name !== CACHE_DIRECTORY && (includeHidden || !entry.name.startsWith('.')) && (entry.isDirectory() || (entry.isFile() && isConventionalInvertedName(entry.name)))).length : null;
   for (const entry of directoryEntries.sort((left, right) => Number(right.isDirectory()) - Number(left.isDirectory()) || left.name.localeCompare(right.name))) {
     if (entry.name === CACHE_DIRECTORY || (!includeHidden && entry.name.startsWith('.'))) continue;
     const source = join(directory, entry.name); const path = relative(openedRoot, source);
-    if (entry.isDirectory()) { if (matched++ < offset) continue; if (entries.length >= limit) { hasMore = true; break; } entries.push({ path, name: entry.name, directory: true }); continue; }
+    if (entry.isDirectory()) { if (matched++ < offset) continue; if (entries.length >= limit) { hasMore = true; break; } const info = await fs.stat(source); entries.push({ path, name: entry.name, directory: true, access: await entryAccess(source, info) }); continue; }
     if (!entry.isFile()) continue;
     if (query && !entry.name.toLowerCase().includes(query)) continue;
-    const header = await sourceHeader(source); const textMime = textMimeFor(entry.name);
+    const info = await fs.stat(source); const access = await entryAccess(source, info); const textMime = textMimeFor(entry.name);
+    if (!access.capabilities.open) { if (!isConventionalInvertedName(entry.name)) continue; const record = { path, name: entry.name, size: info.size, modified: info.mtimeMs, mime: 'Unavailable', kind: 'other', editableText: false, thumbnail: null, access }; if (matched++ < offset) continue; if (entries.length >= limit) { hasMore = true; break; } entries.push(record); continue; }
+    let header; try { header = await sourceHeader(source); }
+    catch (error) { if (error?.code !== 'EACCES' && error?.code !== 'EPERM') throw error; const refreshedAccess = await entryAccess(source, info); const record = { path, name: entry.name, size: info.size, modified: info.mtimeMs, mime: 'Unavailable', kind: 'other', editableText: false, thumbnail: null, access: refreshedAccess }; if (matched++ < offset) continue; if (entries.length >= limit) { hasMore = true; break; } entries.push(record); continue; }
     if (!isInvertedMedia(header) && !(textMime && isConventionalInvertedName(entry.name))) continue;
-    const restored = xor(header); const detectedMime = detectMime(restored); const mime = detectedMime === 'application/octet-stream' && textMime ? textMime : detectedMime; const info = await fs.stat(source); const frameDurationMs = detectedMime.startsWith('video/') ? videoFrameDurationMs(restored) : null;
-    const record = { path, name: entry.name, size: info.size, modified: info.mtimeMs, mime, kind: kindFor(mime), editableText: Boolean(textMime), thumbnail: null, ...(frameDurationMs ? { frameDurationMs } : {}) };
+    const restored = xor(header); const detectedMime = detectMime(restored); const mime = detectedMime === 'application/octet-stream' && textMime ? textMime : detectedMime; const frameDurationMs = detectedMime.startsWith('video/') ? videoFrameDurationMs(restored) : null;
+    const record = { path, name: entry.name, size: info.size, modified: info.mtimeMs, mime, kind: kindFor(mime), editableText: Boolean(textMime), thumbnail: null, access, ...(frameDurationMs ? { frameDurationMs } : {}) };
     if (matched++ < offset) continue;
     if (entries.length >= limit) { hasMore = true; break; }
-    if (record.kind === 'videos') { if (await isCurrentThumbnail(path, source, manifest)) record.thumbnail = `/api/thumbnail?path=${encodeURIComponent(path)}`; else { record.thumbnail = 'pending'; void thumbnailJob(path, source); } }
+    if (record.kind === 'videos') { if (await isCurrentThumbnail(path, source, manifest)) record.thumbnail = `/api/thumbnail?path=${encodeURIComponent(path)}`; else if (cacheWritable) { record.thumbnail = 'pending'; void thumbnailJob(path, source); } }
     entries.push(record);
   }
   const range = frameMetadata ? frameTimeRangeFor(frameMetadata.durationMs, frameMetadata.frameCount, entries.map((entry) => entry.name)) : null;
   const frameTimeRange = range ? { sourceName: frameMetadata.sourceName, ...range } : null;
-  return { files: entries, hasMore, total, frameTimeRange };
+  return { files: entries, hasMore, total, frameTimeRange, directoryAccess, parentAccess, cacheWritable };
 }
 function sendJson(response, status, value) { response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); response.end(JSON.stringify(value)); }
 function contentType(file) { return ({ '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' })[extname(file)] || 'application/octet-stream'; }
@@ -399,6 +417,7 @@ export function validateRenameName(name) {
 }
 async function createFile(directoryPath, requestedName) {
   const directory = await resolveDirectory(directoryPath || ''); const name = validateRenameName(requestedName); const storedName = invertedName(name); const destination = join(directory, storedName);
+  await assertCapability(directory, 'createChildren', 'This directory is read-only and cannot accept new files.');
   try { await fs.writeFile(destination, Buffer.alloc(0), { flag: 'wx' }); }
   catch (error) { if (error?.code === 'EEXIST') throw new Error(`An item already exists with that name: ${storedName}`); throw error; }
   return { path: relative(openedRoot, destination), name: storedName };
@@ -406,6 +425,7 @@ async function createFile(directoryPath, requestedName) {
 async function renameEntry(path, requestedName) {
   const { source, info } = await resolveManagedEntry(path); const name = validateRenameName(requestedName);
   if (!info.isFile() && !info.isDirectory()) throw new Error('Only files and folders can be renamed.');
+  await assertCapability(source, 'rename', 'The parent directory is read-only; this item cannot be renamed.', info);
   const storedName = info.isDirectory() ? name : invertedName(name); const destination = join(dirname(source), storedName);
   resolveOpenedPath(relative(openedRoot, destination));
   if (destination === source) return { path: relative(openedRoot, destination), name: storedName };
@@ -421,8 +441,10 @@ async function moveEntries(paths, destinationPath) {
     if (destination === openedRoot) throw new Error('The opened folder has no parent directory.');
     const info = await fs.stat(destination); if (!info.isDirectory()) throw new Error('The parent path is not a directory.'); await fs.readdir(destination);
   } else destination = await resolveDirectory(destinationPath || '');
+  if (!(await entryAccess(destination)).capabilities.createChildren) throw new HttpError(403, 'The destination directory is read-only.');
   const uniquePaths = [...new Set(paths)];
   const entries = await Promise.all(uniquePaths.map(async (path) => ({ path, ...(await resolveManagedEntry(path)) })));
+  for (const { source, info } of entries) await assertCapability(source, 'move', 'An item cannot be moved because its parent directory is read-only.', info);
   const targets = entries.map(({ source }) => join(destination, basename(source)));
   if (new Set(targets).size !== targets.length) throw new Error('Selected items would use the same destination name.');
   for (let index = 0; index < entries.length; index += 1) { const { source, info } = entries[index]; const target = targets[index]; if (dirname(source) === destination) throw new Error('An item is already in that folder.'); if (info.isDirectory() && (destination === source || destination.startsWith(`${source}${sep}`))) throw new Error('A folder cannot be moved into itself.'); try { await fs.lstat(target); throw new Error(`A destination item already exists: ${basename(target)}`); } catch (error) { if (error?.code !== 'ENOENT') throw error; } }
@@ -430,7 +452,7 @@ async function moveEntries(paths, destinationPath) {
 }
 async function deleteEntries(paths) {
   if (!Array.isArray(paths) || !paths.length) throw new Error('Select at least one item to delete.');
-  const uniquePaths = [...new Set(paths)]; const entries = await Promise.all(uniquePaths.map((path) => resolveManagedEntry(path)));
+  const uniquePaths = [...new Set(paths)]; const entries = await Promise.all(uniquePaths.map((path) => resolveManagedEntry(path))); for (const { source, info } of entries) await assertCapability(source, 'delete', 'An item cannot be deleted because its parent directory is read-only.', info);
   for (const { source } of entries) await fs.rm(source, { recursive: true, force: false });
 }
 export function rangeFor(header, size) {
@@ -455,15 +477,17 @@ async function handleRequest(request, response) {
     if (request.method === 'POST' && path === '/api/open') { const body = await readJson(request); const candidate = resolve(String(body.path || '')); const info = await fs.stat(candidate); if (!info.isDirectory()) throw new Error('The supplied path is not a directory.'); openedRoot = candidate; const catalog = await scanFolder('', { includeHidden: Boolean(body.showHidden), query: String(body.query || '').toLowerCase() }); return sendJson(response, 200, { root: openedRoot, directory: '', parentListable: await hasListableParent(openedRoot), ...catalog }); }
     if (request.method === 'GET' && path === '/api/catalog') { const directory = url.searchParams.get('path') || ''; const current = await resolveDirectory(directory); const catalog = await scanFolder(directory, { includeHidden: url.searchParams.get('hidden') === '1', query: (url.searchParams.get('query') || '').toLowerCase(), offset: Math.max(0, Number(url.searchParams.get('offset') || 0) || 0), limit: 250 }); return sendJson(response, 200, { root: openedRoot, directory, parentListable: await hasListableParent(current), ...catalog }); }
     if (request.method === 'GET' && path === '/api/jobs') return sendJson(response, 200, [...jobs.values()]);
-    if (request.method === 'POST' && path === '/api/folders') { const body = await readJson(request); const directory = await resolveDirectory(body.directory || ''); await fs.mkdir(join(directory, validateFolderName(body.name))); return sendJson(response, 201, { ok: true }); }
+    if (request.method === 'POST' && path === '/api/folders') { const body = await readJson(request); const directory = await resolveDirectory(body.directory || ''); await assertCapability(directory, 'createChildren', 'This directory is read-only and cannot accept new folders.'); await fs.mkdir(join(directory, validateFolderName(body.name))); return sendJson(response, 201, { ok: true }); }
     if (request.method === 'POST' && path === '/api/files') { const body = await readJson(request); return sendJson(response, 201, await createFile(body.directory, body.name)); }
     if (request.method === 'POST' && path === '/api/files/rename') { const body = await readJson(request); return sendJson(response, 200, await renameEntry(body.path, body.name)); }
     if (request.method === 'POST' && path === '/api/files/move') { const body = await readJson(request); await moveEntries(body.paths, body.destination); return sendJson(response, 200, { ok: true }); }
     if (request.method === 'DELETE' && path === '/api/files') { const body = await readJson(request); await deleteEntries(body.paths); return sendJson(response, 200, { ok: true }); }
-    if (request.method === 'POST' && path === '/api/videos/explode') { const body = await readJson(request); const source = resolveSource(body.path); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be exploded.'); const job = createJob('frames', body.path); void explodeJob(job, body.path, source); return sendJson(response, 202, job); }
-    if (request.method === 'POST' && path === '/api/videos/frame') { const body = await readJson(request); const relativePath = String(body.path || ''); const timeMs = Number(body.timeMs); if (!Number.isFinite(timeMs) || timeMs < 0) throw new Error('A valid video time is required.'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide frames.'); const directory = await resolveFrameOutputDirectory(body.outputDirectory, source); return sendJson(response, 201, await extractVideoFrame(relativePath, source, timeMs, directory)); }
-    if (request.method === 'POST' && path === '/api/videos/segment') { const body = await readJson(request); const relativePath = String(body.path || ''); const startMs = body.startMs; const endMs = body.endMs; if (typeof startMs !== 'number' || !Number.isFinite(startMs) || startMs < 0 || typeof endMs !== 'number' || !Number.isFinite(endMs) || endMs <= startMs) throw new Error('A valid segment start and end are required.'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide segments.'); const directory = await resolveVideoOutputDirectory(body.outputDirectory, source); const job = createJob('segment', relativePath); void segmentJob(job, relativePath, source, startMs, endMs, directory); return sendJson(response, 202, job); }
-    if (request.method === 'POST' && path === '/api/videos/playback') { const body = await readJson(request); const relativePath = String(body.path || ''); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be prepared for playback.'); if (await currentPlaybackPath(relativePath, source)) return sendJson(response, 200, { status: 'ready', url: `/api/videos/playback?path=${encodeURIComponent(relativePath)}` }); const active = activePlaybackJob(relativePath); if (active) return sendJson(response, 202, { status: 'preparing', job: active }); const job = createJob('playback', relativePath); void playbackJob(job, relativePath, source); return sendJson(response, 202, { status: 'preparing', job }); }
+    if (request.method === 'POST' && path === '/api/videos/explode') { const body = await readJson(request); const source = resolveSource(body.path); await assertCapability(source, 'open', 'This video cannot be read.'); await assertCapability(source, 'createSibling', 'The source directory is read-only and cannot accept extracted frames.'); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be exploded.'); const job = createJob('frames', body.path); void explodeJob(job, body.path, source); return sendJson(response, 202, job); }
+    if (request.method === 'POST' && path === '/api/videos/frame') { const body = await readJson(request); const relativePath = String(body.path || ''); const timeMs = Number(body.timeMs); if (!Number.isFinite(timeMs) || timeMs < 0) throw new Error('A valid video time is required.'); const source = resolveSource(relativePath); await assertCapability(source, 'open', 'This video cannot be read.'); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide frames.'); const directory = await resolveFrameOutputDirectory(body.outputDirectory, source); return sendJson(response, 201, await extractVideoFrame(relativePath, source, timeMs, directory)); }
+    if (request.method === 'POST' && path === '/api/videos/segment') { const body = await readJson(request); const relativePath = String(body.path || ''); const startMs = body.startMs; const endMs = body.endMs; if (typeof startMs !== 'number' || !Number.isFinite(startMs) || startMs < 0 || typeof endMs !== 'number' || !Number.isFinite(endMs) || endMs <= startMs) throw new Error('A valid segment start and end are required.'); const source = resolveSource(relativePath); await assertCapability(source, 'open', 'This video cannot be read.'); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can provide segments.'); const directory = await resolveVideoOutputDirectory(body.outputDirectory, source); const job = createJob('segment', relativePath); void segmentJob(job, relativePath, source, startMs, endMs, directory); return sendJson(response, 202, job); }
+    if (request.method === 'POST' && path === '/api/videos/playback') { const body = await readJson(request); const relativePath = String(body.path || ''); const source = resolveSource(relativePath); await assertCapability(source, 'open', 'This video cannot be read.'); const mime = detectMime(await restoredHeader(source)); if (!mime.startsWith('video/')) throw new Error('Only detected video files can be prepared.'); if (await currentPlaybackPath(relativePath, source)) return sendJson(response, 200, { status: 'ready', url: `/api/videos/playback?path=${encodeURIComponent(relativePath)}` }); if (!(await canWriteCache())) throw new HttpError(403, 'The cache directory is read-only; compatible playback cannot be prepared.'); const active = activePlaybackJob(relativePath); if (active) return sendJson(response, 202, { status: 'preparing', job: active }); const job = createJob('playback', relativePath); void playbackJob(job, relativePath, source); return sendJson(response, 202, { status: 'preparing', job }); }
+    if (request.method === 'GET' && path === '/api/access') { const relativePath = url.searchParams.get('path'); const { source, info } = await resolveManagedEntry(relativePath); return sendJson(response, 200, await entryAccess(source, info)); }
+    if (request.method === 'POST' && path === '/api/access/directory') { const body = await readJson(request); if (typeof body.path !== 'string' || !isAbsolute(body.path)) throw new Error('An absolute directory path is required.'); const directory = resolve(body.path); const info = await fs.stat(directory); if (!info.isDirectory()) throw new Error('The supplied path is not a directory.'); return sendJson(response, 200, await entryAccess(directory, info)); }
     if (request.method === 'GET' && path === '/api/videos/playback') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const playback = await currentPlaybackPath(relativePath, source); if (!playback) throw new Error('A compatible playback copy is not ready.'); const sourceName = restoredName(basename(relativePath)); const filename = `${basename(sourceName, extname(sourceName)) || 'video'}.mp4`; return serveRestored(request, response, playback, 'video/mp4', filename); }
     if (request.method === 'GET' && path === '/api/media') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const mime = detectMime(await restoredHeader(source)); return serveRestored(request, response, source, mime, restoredName(basename(source))); }
     if (request.method === 'GET' && path === '/api/thumbnail') { const relativePath = url.searchParams.get('path'); const source = resolveSource(relativePath); const manifest = await readManifest(); const thumbnail = manifest.files[relativePath]?.thumbnail; if (!thumbnail) throw new Error('Thumbnail is not ready.'); return serveRestored(request, response, thumbnail, 'image/jpeg', basename(thumbnail)); }

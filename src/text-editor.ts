@@ -1,11 +1,12 @@
-import type { Extension } from '@codemirror/state';
+import { Compartment, EditorSelection, EditorState, type Extension } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 
 export type IntegratedTextEditor = {
   destroy(): void;
   focus(): void;
   getContent(): string;
-  replaceContent(content: string): void;
+  replaceContent(content: string, options?: { preserveView?: boolean }): void;
+  setReadOnly(readOnly: boolean): void;
 };
 
 type EditorOptions = {
@@ -14,6 +15,7 @@ type EditorOptions = {
   fileName: string;
   filePath: string;
   mime: string;
+  readOnly?: boolean;
   onChange: (content: string) => void;
   onSave: () => void;
   onMessage: (message: string) => void;
@@ -66,8 +68,9 @@ export async function createIntegratedTextEditor(options: EditorOptions): Promis
   const markdown = options.mime === 'text/markdown' || extensionFor(options.fileName) === 'md';
   options.container.innerHTML = `<div class="integrated-editor${markdown ? ' markdown-editor' : ''}">${markdown ? '<div class="text-view-tabs" role="tablist" aria-label="Markdown view"><button id="text-editor-tab" type="button" role="tab" class="active" aria-selected="true" aria-controls="text-editor-panel" data-text-view="editor">Editor</button><button id="text-preview-tab" type="button" role="tab" tabindex="-1" aria-selected="false" aria-controls="text-preview-panel" data-text-view="preview">Preview</button></div>' : ''}<div class="code-editor-host" id="text-editor-panel" data-text-panel="editor"${markdown ? ' role="tabpanel" aria-labelledby="text-editor-tab"' : ''}></div>${markdown ? '<article class="markdown-preview" id="text-preview-panel" data-text-panel="preview" role="tabpanel" aria-labelledby="text-preview-tab" hidden></article>' : ''}</div>`;
   const root = options.container.querySelector<HTMLElement>('.integrated-editor'); const host = options.container.querySelector<HTMLElement>('.code-editor-host'); if (!root || !host) throw new Error('The integrated editor could not be created.');
-  let replacing = false; let previewTimer: number | undefined; let previewActive = false; let previewVersion = 0;
-  const view = new EditorView({ parent: host, doc: options.content, extensions: [basicSetup, editorTheme, EditorView.contentAttributes.of({ 'aria-label': `Editor for ${options.fileName}`, spellcheck: 'false' }), ...(await languageFor(options.fileName, options.mime)), EditorView.updateListener.of((update) => { if (!update.docChanged || replacing) return; const content = update.state.doc.toString(); options.onChange(content); if (previewActive) { window.clearTimeout(previewTimer); previewTimer = window.setTimeout(() => void renderPreview(), 150); } })] });
+  let replacing = false; let previewTimer: number | undefined; let previewActive = false; let previewVersion = 0; const readOnly = new Compartment();
+  const readOnlyExtensions = (value: boolean) => [EditorState.readOnly.of(value), EditorView.editable.of(!value)];
+  const view = new EditorView({ parent: host, doc: options.content, extensions: [basicSetup, editorTheme, readOnly.of(readOnlyExtensions(Boolean(options.readOnly))), EditorView.contentAttributes.of({ 'aria-label': `Editor for ${options.fileName}`, spellcheck: 'false' }), ...(await languageFor(options.fileName, options.mime)), EditorView.updateListener.of((update) => { if (!update.docChanged || replacing) return; const content = update.state.doc.toString(); options.onChange(content); if (previewActive) { window.clearTimeout(previewTimer); previewTimer = window.setTimeout(() => void renderPreview(), 150); } })] });
 
   async function renderPreview(): Promise<void> {
     const preview = options.container.querySelector<HTMLElement>('.markdown-preview'); if (!preview) return; const version = ++previewVersion; preview.setAttribute('aria-busy', 'true');
@@ -90,6 +93,13 @@ export async function createIntegratedTextEditor(options: EditorOptions): Promis
     destroy: () => { window.clearTimeout(previewTimer); previewVersion += 1; view.destroy(); },
     focus: () => view.focus(),
     getContent: () => view.state.doc.toString(),
-    replaceContent: (content) => { replacing = true; view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content } }); replacing = false; options.onChange(content); if (previewActive) void renderPreview(); },
+    setReadOnly: (value) => view.dispatch({ effects: readOnly.reconfigure(readOnlyExtensions(value)) }),
+    replaceContent: (content, replaceOptions = {}) => {
+      const scrollTop = view.scrollDOM.scrollTop; const scrollLeft = view.scrollDOM.scrollLeft; const nextLength = content.length;
+      const selection = replaceOptions.preserveView ? EditorSelection.create(view.state.selection.ranges.map((range) => EditorSelection.range(Math.min(range.anchor, nextLength), Math.min(range.head, nextLength))), view.state.selection.mainIndex) : undefined;
+      replacing = true; view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content }, ...(selection ? { selection } : {}) }); replacing = false;
+      if (replaceOptions.preserveView) { view.scrollDOM.scrollTop = scrollTop; view.scrollDOM.scrollLeft = scrollLeft; window.requestAnimationFrame(() => { view.scrollDOM.scrollTop = scrollTop; view.scrollDOM.scrollLeft = scrollLeft; }); }
+      if (previewActive) void renderPreview();
+    },
   };
 }

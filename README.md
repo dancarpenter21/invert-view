@@ -105,6 +105,30 @@ npm start
 
 Then open `http://127.0.0.1:4174`.
 
+## File permissions
+
+Catalog entries, preview panes, and full viewers reflect the effective file
+permissions of the user running the local service. Compact cards show a small
+closed lock only when content is read-only; selected previews and full viewers
+also show **Writable** or **Read-only** with the four-digit Unix mode. The
+current directory and configured extraction destinations report the same
+status.
+
+Actions follow Unix filesystem semantics. Editing content requires a writable
+file and a parent directory that permits the app's atomic replacement. Rename,
+move, and delete depend on parent and destination directory permissions, so a
+locked `0444` file may still be renamed or deleted from a writable folder.
+Creation, drag-and-drop destinations, extraction controls, context actions,
+and multi-selection actions are disabled when their required capability is not
+available, and the server checks permissions again before changing anything.
+Force-overwriting never bypasses a read-only permission.
+
+Permission changes are picked up by the same live watcher as content changes,
+with polling as a fallback. If an open text editor becomes read-only, its
+current buffer is preserved and becomes editable again if write access returns.
+The integrated terminal remains a normal shell and relies on native operating
+system permission errors rather than browser-side restrictions.
+
 ## Media cache, frames, and segments
 
 When the service detects an inverted video, it creates a thumbnail in the
@@ -169,6 +193,15 @@ unsaved buffer as sanitized GitHub-style Markdown; the rendered view is
 read-only and embedded HTML cannot execute scripts or event handlers. The
 editor accepts files up to 5 MB. Saving bytewise-inverts the updated UTF-8 text
 and atomically replaces the selected `.inv` source file.
+
+While an editable text file is open, the same directory watcher used by the
+catalog follows changes made by local agents or other programs. A clean editor
+and an open Markdown preview reload automatically. If the browser has unsaved
+edits, its buffer and preview are preserved and the viewer offers explicit
+actions to reload the newest disk version or overwrite it. The status beside
+the Save button shows whether the viewer is watching live or using its
+three-second polling fallback. Renamed, deleted, invalid, or oversized disk
+versions leave the last browser buffer available so work is not silently lost.
 
 The API binds only to `127.0.0.1`, validates every requested path against the
 opened root, and never traverses `.inv-cache` as source content.
