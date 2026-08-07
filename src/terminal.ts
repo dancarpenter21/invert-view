@@ -9,8 +9,8 @@ type TerminalServerMessage =
   | { type: 'exit'; code: number; signal: number }
   | { type: 'error'; message: string };
 
-const HEIGHT_KEY = 'inv-viewer-terminal-height';
-const OPEN_KEY = 'inv-viewer-terminal-open';
+const HEIGHT_KEY = 'railroad-logistics-terminal-height';
+const OPEN_KEY = 'railroad-logistics-terminal-open';
 const DEFAULT_HEIGHT = 260;
 const MIN_HEIGHT = 140;
 
@@ -103,7 +103,7 @@ export class BrowserTerminal {
   private ensureTerminal(): void {
     if (!this.terminal) {
       this.terminal = new Terminal({
-        cursorBlink: true, cursorStyle: 'bar', fontFamily: "'DM Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", fontSize: 13, lineHeight: 1.25, scrollback: 5_000,
+        cursorBlink: true, cursorStyle: 'bar', fontFamily: "'MesloLGS NF', 'DM Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", fontSize: 13, fontWeight: 400, fontWeightBold: 700, lineHeight: 1.25, scrollback: 5_000,
         theme: { background: '#101113', foreground: '#d8ff49', cursor: '#d8ff49', cursorAccent: '#101113', selectionBackground: '#59622699', black: '#17181b', brightBlack: '#686a72', red: '#ff7a86', brightRed: '#ff9ba4', green: '#b9e33c', brightGreen: '#d8ff49', yellow: '#e6cf6a', brightYellow: '#f4e282', blue: '#75a7ff', brightBlue: '#9bbfff', magenta: '#c893ff', brightMagenta: '#dcb5ff', cyan: '#63d7d2', brightCyan: '#88ebe6', white: '#d8d9dc', brightWhite: '#ffffff' },
       });
       this.fitAddon = new FitAddon(); this.terminal.loadAddon(this.fitAddon); this.terminal.open(this.host);

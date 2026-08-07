@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createTerminalWebSocketServer, TERMINAL_SOCKET_PATH, websocketOriginAllowed } from './terminal-server.mjs';
 
-const PORT = Number(process.env.INV_VIEWER_PORT || 4174);
+const PORT = Number(process.env.RAILROAD_LOGISTICS_PORT || 4174);
 const CACHE_DIRECTORY = '.inv-cache';
 const THUMBNAIL_DIRECTORY = 'thumbnails';
 const PLAYBACK_DIRECTORY = 'playback';
@@ -204,7 +204,7 @@ async function currentPlaybackPath(relativePath, source, manifest) {
 }
 async function invertFile(source, destination) { await pipeline(createReadStream(source), new Transform({ transform(chunk, _encoding, callback) { callback(null, xor(chunk)); } }), createWriteStream(destination)); }
 async function restoredTemporaryFile(source) {
-  const suffix = extname(restoredName(source)) || '.bin'; const destination = join(tmpdir(), `inv-viewer-${randomUUID()}${suffix}`);
+  const suffix = extname(restoredName(source)) || '.bin'; const destination = join(tmpdir(), `railroad-logistics-${randomUUID()}${suffix}`);
   await invertFile(source, destination); return destination;
 }
 function reportJob(job, force = false) {
@@ -237,7 +237,7 @@ async function thumbnailJob(relativePath, source) {
   const job = createJob('thumbnail', relativePath); job.status = 'running'; reportJob(job, true);
   const paths = artifactPaths(relativePath); let restored = null; let temporaryJpg = null;
   try {
-    restored = await restoredTemporaryFile(source); temporaryJpg = join(tmpdir(), `inv-viewer-${randomUUID()}.jpg`);
+    restored = await restoredTemporaryFile(source); temporaryJpg = join(tmpdir(), `railroad-logistics-${randomUUID()}.jpg`);
     await fs.mkdir(dirname(paths.thumbnail), { recursive: true });
     try { await runFfmpeg(['-ss', '00:00:01', '-i', restored, '-frames:v', '1', '-q:v', '2', temporaryJpg], job); }
     catch { await runFfmpeg(['-i', restored, '-frames:v', '1', '-q:v', '2', temporaryJpg], job); }
@@ -257,7 +257,7 @@ async function playbackJob(job, relativePath, source) {
   let restored = null; let encoded = null; let staged = null;
   try {
     const initialFingerprint = await fileFingerprint(source);
-    restored = await restoredTemporaryFile(source); job.durationMs = await durationFor(restored); encoded = join(tmpdir(), `inv-viewer-${randomUUID()}.mp4`);
+    restored = await restoredTemporaryFile(source); job.durationMs = await durationFor(restored); encoded = join(tmpdir(), `railroad-logistics-${randomUUID()}.mp4`);
     await runFfmpeg(['-i', restored, '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', encoded], job);
     const finalFingerprint = await fileFingerprint(source);
     if (!fingerprintMatches(initialFingerprint, finalFingerprint)) throw new Error('The source video changed while its compatible copy was being prepared.');
@@ -290,7 +290,7 @@ async function availableFrameDestination(relativePath, timeMs, directory) {
 async function extractVideoFrame(relativePath, source, timeMs, directory) {
   let restored = null; let jpeg = null; let staged = null;
   try {
-    restored = await restoredTemporaryFile(source); jpeg = join(tmpdir(), `inv-viewer-${randomUUID()}.jpg`);
+    restored = await restoredTemporaryFile(source); jpeg = join(tmpdir(), `railroad-logistics-${randomUUID()}.jpg`);
     await runFfmpeg(['-ss', (timeMs / 1_000).toFixed(3), '-i', restored, '-frames:v', '1', '-q:v', '2', jpeg], {});
     const destination = await availableFrameDestination(relativePath, timeMs, directory); staged = `${destination}.${randomUUID()}.tmp`; await invertFile(jpeg, staged); await fs.rename(staged, destination); staged = null;
     return { outputPath: destination, name: basename(destination), timeMs: Math.round(timeMs) };
@@ -316,10 +316,10 @@ async function segmentJob(job, relativePath, source, requestedStartMs, requested
     if (requestedEndMs > sourceDurationMs + 250) throw new Error('The segment end is beyond the end of the video.');
     const startMs = Math.round(requestedStartMs); const endMs = Math.round(Math.min(requestedEndMs, sourceDurationMs));
     if (endMs <= startMs) throw new Error('The segment end must be after its start.');
-    job.durationMs = endMs - startMs; encoded = join(tmpdir(), `inv-viewer-${randomUUID()}.mp4`);
+    job.durationMs = endMs - startMs; encoded = join(tmpdir(), `railroad-logistics-${randomUUID()}.mp4`);
     await runFfmpeg(['-i', restored, '-ss', (startMs / 1_000).toFixed(3), '-t', ((endMs - startMs) / 1_000).toFixed(3), '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', encoded], job);
     if (!fingerprintMatches(initialFingerprint, await fileFingerprint(source))) throw new Error('The source video changed while the segment was being extracted.');
-    staged = join(directory, `.inv-viewer-segment-${randomUUID()}.tmp`); await invertFile(encoded, staged);
+    staged = join(directory, `.railroad-logistics-segment-${randomUUID()}.tmp`); await invertFile(encoded, staged);
     if (!fingerprintMatches(initialFingerprint, await fileFingerprint(source))) throw new Error('The source video changed while the segment was being extracted.');
     const destination = await commitSegment(staged, relativePath, startMs, endMs, directory); staged = null;
     job.result = { outputPath: destination, name: basename(destination), startMs, endMs }; job.status = 'complete'; job.progress = 1; reportJob(job, true);
@@ -331,7 +331,7 @@ async function explodeJob(job, relativePath, source) {
   job.status = 'running'; reportJob(job, true); const paths = artifactPaths(relativePath);
   let restored = null; let work = null; let staged = null;
   try {
-    restored = await restoredTemporaryFile(source); job.durationMs = await durationFor(restored); work = join(tmpdir(), `inv-viewer-frames-${randomUUID()}`); await fs.mkdir(work);
+    restored = await restoredTemporaryFile(source); job.durationMs = await durationFor(restored); work = join(tmpdir(), `railroad-logistics-frames-${randomUUID()}`); await fs.mkdir(work);
     const observedDurationMs = await runFfmpeg(['-i', restored, '-q:v', '2', join(work, '%06d.jpg')], job);
     const generated = (await fs.readdir(work)).filter((name) => name.endsWith('.jpg')).sort(); if (!generated.length) throw new Error('ffmpeg produced no frames.');
     staged = `${paths.frames}.${randomUUID()}.tmp`; await fs.mkdir(staged, { recursive: true });
@@ -515,7 +515,7 @@ liveWebSockets.on('connection', (socket) => {
   socket.once('close', stopWatching);
 });
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  server.listen(PORT, '127.0.0.1', () => console.log(`Uninvert API listening on http://127.0.0.1:${PORT}`));
+  server.listen(PORT, '127.0.0.1', () => console.log(`Railroad Logistics listening on http://127.0.0.1:${PORT}`));
   const shutdown = () => {
     for (const client of terminalWebSockets.clients) client.terminate();
     for (const client of liveWebSockets.clients) client.terminate();

@@ -14,24 +14,24 @@ const MAX_COLUMNS = 500;
 const MIN_ROWS = 1;
 const MAX_ROWS = 200;
 const SHELL_INTEGRATION = `
-typeset -g __inv_view_original_zdotdir="\${INV_VIEWER_ORIGINAL_ZDOTDIR:-\$HOME}"
-ZDOTDIR="\$__inv_view_original_zdotdir"
+typeset -g __railroad_logistics_original_zdotdir="\${RAILROAD_LOGISTICS_ORIGINAL_ZDOTDIR:-\$HOME}"
+ZDOTDIR="\$__railroad_logistics_original_zdotdir"
 if [[ -r "\$ZDOTDIR/.zshrc" ]]; then
   source "\$ZDOTDIR/.zshrc"
 fi
 autoload -Uz add-zsh-hook
-function __inv_view_preexec() { print -n -- \$'\\e]633;C\\a' }
-function __inv_view_precmd() { print -n -- \$'\\e]633;D\\a' }
-add-zsh-hook preexec __inv_view_preexec
-add-zsh-hook precmd __inv_view_precmd
-unset __inv_view_original_zdotdir
+function __railroad_logistics_preexec() { print -n -- \$'\\e]633;C\\a' }
+function __railroad_logistics_precmd() { print -n -- \$'\\e]633;D\\a' }
+add-zsh-hook preexec __railroad_logistics_preexec
+add-zsh-hook precmd __railroad_logistics_precmd
+unset __railroad_logistics_original_zdotdir
 `;
 
 let integrationDirectoryPromise;
 
 async function integrationDirectory() {
   if (!integrationDirectoryPromise) integrationDirectoryPromise = (async () => {
-    const directory = await fs.mkdtemp(join(tmpdir(), 'inv-view-zsh-'));
+    const directory = await fs.mkdtemp(join(tmpdir(), 'railroad-logistics-zsh-'));
     await fs.writeFile(join(directory, '.zshrc'), SHELL_INTEGRATION, { mode: 0o600 });
     process.once('exit', () => { try { rmSync(directory, { recursive: true, force: true }); } catch { /* The OS also clears its temporary directory. */ } });
     return directory;
@@ -93,7 +93,7 @@ export function attachTerminalSocket(socket, { shell = '/usr/bin/zsh', spawnPty 
         if (closed) return;
         terminal = spawnPty(shell, ['-i'], {
           name: 'xterm-256color', cols, rows, cwd,
-          env: { ...environment, TERM: 'xterm-256color', COLORTERM: 'truecolor', SHELL: shell, INV_VIEWER_ORIGINAL_ZDOTDIR: environment.ZDOTDIR || environment.HOME || '', ZDOTDIR: zdotdir },
+          env: { ...environment, TERM: 'xterm-256color', COLORTERM: 'truecolor', SHELL: shell, RAILROAD_LOGISTICS_ORIGINAL_ZDOTDIR: environment.ZDOTDIR || environment.HOME || '', ZDOTDIR: zdotdir },
         });
         const parseStatus = createShellStatusParser((busy) => send({ type: 'status', busy }));
         terminal.onData((data) => { parseStatus(data); send({ type: 'output', data }); });

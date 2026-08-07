@@ -1,6 +1,6 @@
-# Uninvert File Browser
+# Railroad Logistics
 
-Uninvert is a private, local viewer for files produced by `../invert_file.py`.
+Railroad Logistics is a private, local file and media workspace for files produced by `../invert_file.py`.
 It determines an inverted file's restored MIME type from its file signature,
 hides recognizable files that are already uninverted, then streams restored
 images and videos to the browser without uploading them. Video playback uses
@@ -33,7 +33,7 @@ only that folder's immediate contents; open directory entries or use **Up** to
 navigate the tree. `npm run dev` starts both the browser UI and the local API.
 The development launch sets
 `VITE_DEFAULT_FOLDER` to `/home/danc/.diadev/docs`; set
-`INV_VIEWER_DEFAULT_FOLDER` before launching to choose another initial folder.
+`RAILROAD_LOGISTICS_DEFAULT_FOLDER` before launching to choose another initial folder.
 Production starts with no folder open.
 
 ## Integrated terminal
@@ -42,6 +42,10 @@ The bottom dock runs a real interactive zsh session on the same machine and
 with the same user permissions as the server. It is intended only for this
 loopback-only local application; commands entered in the browser can read,
 change, or delete anything that user can access.
+
+The terminal bundles MesloLGS NF in regular, bold, italic, and bold italic
+weights so Nerd Font prompt symbols render without a font installed in the
+browser's host operating system.
 
 A new shell starts in the folder currently displayed by the file browser. The
 shell and browser then navigate independently so changing folders does not
@@ -114,8 +118,8 @@ job. Its browser-compatible MP4 is stored inverted under `.inv-cache/playback/`
 and reused until the source size or modification time changes. The viewer shows
 conversion progress, and the job continues if you return to the catalog. Plain
 restored and transcoded intermediates exist only in the operating system's
-temporary directory and are removed when the job finishes or fails. Restore &
-download always returns the original restored format, not the cached derivative.
+temporary directory and are removed when the job finishes or fails. Download
+always returns the original restored format, not the cached derivative.
 
 The full video player includes previous-frame and next-frame buttons. AVI files
 use their declared frame interval; other containers fall back to a 30 fps step.
