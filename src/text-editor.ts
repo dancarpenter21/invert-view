@@ -41,10 +41,11 @@ function markdownImageUrl(documentPath: string, reference: string): string | nul
   return `/api/media?path=${encodeURIComponent(path)}`;
 }
 
-function markdownLinkAt(view: EditorView, position: number, side: -1 | 1): { from: number; to: number; reference: string } | null {
-  let node: SyntaxNode | null = syntaxTree(view.state).resolveInner(position, side);
+type ImageHoverTarget = { from: number; to: number; reference: string };
+
+function markdownImageTargetAt(view: EditorView, node: SyntaxNode | null): ImageHoverTarget | null {
   while (node && node.name !== 'Link' && node.name !== 'Image') node = node.parent;
-  if (!node || node.name !== 'Link') return null;
+  if (!node) return null;
   const url = node.getChild('URL');
   if (!url) return null;
   let reference = view.state.sliceDoc(url.from, url.to);
@@ -53,17 +54,37 @@ function markdownLinkAt(view: EditorView, position: number, side: -1 | 1): { fro
   return { from: node.from, to: node.to, reference };
 }
 
+function htmlImageTargetAt(view: EditorView, node: SyntaxNode | null): ImageHoverTarget | null {
+  let container = node;
+  while (container && container.name !== 'Element' && container.name !== 'OpenTag' && container.name !== 'SelfClosingTag') container = container.parent;
+  if (!container) return null;
+  const tag = container.name === 'Element' ? container.getChild('OpenTag') || container.getChild('SelfClosingTag') : container;
+  const tagName = tag?.getChild('TagName'); if (!tag || !tagName) return null;
+  const name = view.state.sliceDoc(tagName.from, tagName.to).toLowerCase(); const attributeName = name === 'img' ? 'src' : name === 'a' ? 'href' : ''; if (!attributeName) return null;
+  for (const attribute of tag.getChildren('Attribute')) {
+    const key = attribute.getChild('AttributeName'); const value = attribute.getChild('AttributeValue') || attribute.getChild('UnquotedAttributeValue'); if (!key || !value || view.state.sliceDoc(key.from, key.to).toLowerCase() !== attributeName) continue;
+    let reference = view.state.sliceDoc(value.from, value.to); if ((reference.startsWith('"') && reference.endsWith('"')) || (reference.startsWith("'") && reference.endsWith("'"))) reference = reference.slice(1, -1);
+    return { from: container.from, to: container.to, reference };
+  }
+  return null;
+}
+
+function imageHoverTargetAt(view: EditorView, position: number, side: -1 | 1): ImageHoverTarget | null {
+  const node = syntaxTree(view.state).resolveInner(position, side);
+  return markdownImageTargetAt(view, node) || htmlImageTargetAt(view, node);
+}
+
 function markdownImageHover(documentPath: string): Extension {
   return hoverTooltip(async (view, position, side) => {
-    const link = markdownLinkAt(view, position, side); if (!link || link.reference.startsWith('//') || /^[a-z][a-z\d+.-]*:/i.test(link.reference)) return null;
-    let referencedPath: string; try { referencedPath = decodeURIComponent(link.reference.split(/[?#]/, 1)[0]); } catch { return null; }
+    const target = imageHoverTargetAt(view, position, side); if (!target || target.reference.startsWith('//') || /^[a-z][a-z\d+.-]*:/i.test(target.reference)) return null;
+    let referencedPath: string; try { referencedPath = decodeURIComponent(target.reference.split(/[?#]/, 1)[0]); } catch { return null; }
     if (!/\.inv$/i.test(referencedPath)) return null;
-    const source = markdownImageUrl(documentPath, link.reference); if (!source) return null;
+    const source = markdownImageUrl(documentPath, target.reference); if (!source) return null;
     const image = await new Promise<HTMLImageElement | null>((resolve) => { const candidate = new Image(); candidate.onload = () => resolve(candidate); candidate.onerror = () => resolve(null); candidate.src = source; });
     if (!image) return null;
-    image.alt = `Preview of ${link.reference}`;
+    image.alt = `Preview of ${target.reference}`;
     return {
-      pos: link.from, end: link.to, above: true,
+      pos: target.from, end: target.to, above: true,
       create: () => {
         const dom = document.createElement('div'); dom.className = 'cm-markdown-image-preview';
         dom.append(image);

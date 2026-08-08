@@ -183,25 +183,33 @@ their source video again.
 Double-clicking a supported inverted text file opens a CodeMirror editor with
 line numbers, search, undo/redo, and syntax highlighting where available. The
 supported extensions are `.txt`, `.md`, `.json`, `.yaml`, `.yml`, `.csv`,
-`.log`, `.xml`, `.html`, `.css`, `.js`, and `.ts`. Use **Save** or Ctrl/Cmd+S
-to write changes. The viewer warns before discarding unsaved edits and rejects
-a save when the source changed on disk, offering explicit reload and overwrite
-actions instead.
+`.log`, `.xml`, `.html`, `.css`, `.js`, and `.ts`. After a 1.5-second pause in
+editing, the current buffer is saved automatically. **Save now** and Ctrl/Cmd+S
+remain available for an immediate write, and leaving the viewer flushes pending
+edits before returning to the file list. The viewer rejects a save when the
+source changed on disk, offering explicit reload and overwrite actions instead.
+
+The editor also keeps the five previous versions written during the current
+viewer session. **Undo saved version** and **Redo saved version** move between
+those checkpoints and write the selected version back through the same conflict
+checks. This saved-version history is separate from CodeMirror's fine-grained
+undo/redo history and is cleared when the viewer closes, the page reloads, or a
+clean buffer is replaced by an external disk update.
 
 Markdown files add **Editor** and **Preview** tabs. Preview renders the current
 unsaved buffer as sanitized GitHub-style Markdown; the rendered view is
-read-only and embedded HTML cannot execute scripts or event handlers. The
-Editor tab previews a relative link ending in `.inv` when the link points to an
-inverted image and is hovered.
-editor accepts files up to 5 MB. Saving bytewise-inverts the updated UTF-8 text
-and atomically replaces the selected `.inv` source file.
+read-only and embedded HTML cannot execute scripts or event handlers. In the
+Editor tab, hovering a relative `.inv` target previews the image for Markdown
+links and images as well as embedded HTML `img[src]` and `a[href]` targets.
+The editor accepts files up to 5 MB. Saving bytewise-inverts the updated UTF-8
+text and atomically replaces the selected `.inv` source file.
 
 While an editable text file is open, the same directory watcher used by the
 catalog follows changes made by local agents or other programs. A clean editor
 and an open Markdown preview reload automatically. If the browser has unsaved
 edits, its buffer and preview are preserved and the viewer offers explicit
 actions to reload the newest disk version or overwrite it. The status beside
-the Save button shows whether the viewer is watching live or using its
+the **Save now** button shows whether the viewer is watching live or using its
 three-second polling fallback. Renamed, deleted, invalid, or oversized disk
 versions leave the last browser buffer available so work is not silently lost.
 

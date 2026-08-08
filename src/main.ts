@@ -309,11 +309,12 @@ let activeTextEditor: IntegratedTextEditor | null = null;
 let activeTextRefresh: (() => void) | null = null;
 let activeTextSetConnectionState: ((live: boolean) => void) | null = null;
 let activeTextSetAccess: ((access: EntryAccess) => void) | null = null;
+let activeTextFlushForClose: (() => Promise<boolean>) | null = null;
 let activeTextSession = 0;
 let activeViewerPermissionRefresh: (() => void) | null = null;
 let activeViewerSession = 0;
 function disposeActiveTextEditor(): void {
-  activeTextSession += 1; activeTextRefresh = null; activeTextSetConnectionState = null; activeTextSetAccess = null; activeTextEditor?.destroy(); activeTextEditor = null;
+  activeTextSession += 1; activeTextRefresh = null; activeTextSetConnectionState = null; activeTextSetAccess = null; activeTextFlushForClose = null; activeTextEditor?.destroy(); activeTextEditor = null;
 }
 function disposeActiveViewer(): void { activeViewerSession += 1; activeViewerPermissionRefresh = null; activeVideoOutputRefresh = null; disposeActiveTextEditor(); }
 function startViewerPermissionUpdates(file: CatalogFile): void {
@@ -332,36 +333,48 @@ function startViewerPermissionUpdates(file: CatalogFile): void {
 }
 async function renderTextEditor(file: CatalogFile, media: HTMLElement): Promise<void> {
   const session = activeTextSession;
-  media.innerHTML = `<div class="text-editor-shell"><div class="text-editor-head"><div class="text-sync-status" id="text-sync-status" data-state="loading"><i aria-hidden="true"></i><span id="text-status">Loading editor…</span></div><button class="restore-button" id="save-text" type="button" disabled>Save</button></div><div class="text-conflict" id="text-conflict" hidden><div><strong>Newer version on disk</strong><span>Your browser edits are preserved. Reload the latest disk version or explicitly overwrite it.</span></div><button type="button" id="reload-text">Reload disk version</button><button type="button" class="danger" id="overwrite-text">Overwrite anyway</button></div><div class="text-disk-warning" id="text-disk-warning" hidden><strong>Disk version unavailable</strong><span id="text-disk-warning-detail"></span></div><div class="text-editor-mount" id="text-editor-mount"><div class="editor-loading">Loading text…</div></div></div>`;
-  const statusWrap = find<HTMLElement>('#text-sync-status'); const status = find<HTMLElement>('#text-status'); const saveButton = find<HTMLButtonElement>('#save-text'); const conflict = find<HTMLElement>('#text-conflict'); const warning = find<HTMLElement>('#text-disk-warning'); const warningDetail = find<HTMLElement>('#text-disk-warning-detail'); const reloadButton = find<HTMLButtonElement>('#reload-text'); const overwriteButton = find<HTMLButtonElement>('#overwrite-text');
-  let snapshot: TextSnapshot; let baseline = ''; let saving = false; let editor: IntegratedTextEditor | null = null; let incoming: TextSnapshot | null = null; let diskError = ''; let live = catalogLive; let access = file.access; let initialized = false; let refreshing = false; let refreshPending = false; let refreshTimer: number | undefined; let statusTimer: number | undefined; let requestVersion = 0;
+  media.innerHTML = `<div class="text-editor-shell"><div class="text-editor-head"><div class="text-sync-status" id="text-sync-status" data-state="loading"><i aria-hidden="true"></i><span id="text-status">Loading editor…</span></div><div class="text-save-actions"><button type="button" id="undo-text-save" disabled>Undo saved version</button><button type="button" id="redo-text-save" disabled>Redo saved version</button><button class="restore-button" id="save-text" type="button" disabled>Save now</button></div></div><div class="text-conflict" id="text-conflict" hidden><div><strong>Newer version on disk</strong><span>Your browser edits are preserved. Reload the latest disk version or explicitly overwrite it.</span></div><button type="button" id="reload-text">Reload disk version</button><button type="button" class="danger" id="overwrite-text">Overwrite anyway</button></div><div class="text-disk-warning" id="text-disk-warning" hidden><strong>Disk version unavailable</strong><span id="text-disk-warning-detail"></span></div><div class="text-editor-mount" id="text-editor-mount"><div class="editor-loading">Loading text…</div></div></div>`;
+  const statusWrap = find<HTMLElement>('#text-sync-status'); const status = find<HTMLElement>('#text-status'); const saveButton = find<HTMLButtonElement>('#save-text'); const undoSaveButton = find<HTMLButtonElement>('#undo-text-save'); const redoSaveButton = find<HTMLButtonElement>('#redo-text-save'); const conflict = find<HTMLElement>('#text-conflict'); const warning = find<HTMLElement>('#text-disk-warning'); const warningDetail = find<HTMLElement>('#text-disk-warning-detail'); const reloadButton = find<HTMLButtonElement>('#reload-text'); const overwriteButton = find<HTMLButtonElement>('#overwrite-text');
+  type SaveReason = 'auto' | 'manual' | 'overwrite' | 'undo' | 'redo' | 'close';
+  type SaveOutcome = 'saved' | 'clean' | 'blocked' | 'failed';
+  const autosaveDelay = 1_500; const savedVersionLimit = 5;
+  let snapshot: TextSnapshot; let baseline = ''; let saving = false; let savingReason: SaveReason | null = null; let closing = false; let editor: IntegratedTextEditor | null = null; let incoming: TextSnapshot | null = null; let diskError = ''; let saveError = ''; let live = catalogLive; let access = file.access; let initialized = false; let refreshing = false; let refreshPending = false; let refreshTimer: number | undefined; let autosaveTimer: number | undefined; let statusTimer: number | undefined; let requestVersion = 0; let lastChangeAt = 0; let activeSave: Promise<SaveOutcome> | null = null; const undoVersions: string[] = []; const redoVersions: string[] = [];
   const valid = () => session === activeTextSession && state.screen === 'viewer' && state.selected?.path === file.path;
   const setStatus = (kind: string, message: string) => { statusWrap.dataset.state = kind; status.textContent = message; };
+  const clearSavedVersions = () => { undoVersions.length = 0; redoVersions.length = 0; };
+  const pushVersion = (versions: string[], content: string) => { if (versions.at(-1) !== content) versions.push(content); while (versions.length > savedVersionLimit) versions.shift(); };
   const renderTextState = () => {
     if (!valid()) return;
     conflict.hidden = !incoming; warning.hidden = !diskError; warningDetail.textContent = diskError;
-    saveButton.disabled = saving || !state.textDirty || Boolean(incoming) || Boolean(diskError) || !access.capabilities.writeContent; reloadButton.disabled = saving; overwriteButton.disabled = saving || !state.textDirty || !access.capabilities.writeContent; saveButton.title = !access.capabilities.writeContent ? `Read-only · ${access.permissions.mode}` : ''; overwriteButton.title = !access.capabilities.writeContent ? 'Permissions do not allow this file to be overwritten.' : '';
-    if (saving) setStatus('saving', 'Saving…');
+    const versionControlsDisabled = saving || closing || state.textDirty || Boolean(incoming) || Boolean(diskError) || !access.capabilities.writeContent;
+    saveButton.disabled = saving || closing || !state.textDirty || Boolean(incoming) || Boolean(diskError) || !access.capabilities.writeContent; undoSaveButton.disabled = versionControlsDisabled || undoVersions.length === 0; redoSaveButton.disabled = versionControlsDisabled || redoVersions.length === 0; reloadButton.disabled = saving || closing; overwriteButton.disabled = saving || closing || !state.textDirty || !access.capabilities.writeContent;
+    saveButton.title = !access.capabilities.writeContent ? `Read-only · ${access.permissions.mode}` : ''; undoSaveButton.title = undoVersions.length ? `${undoVersions.length} earlier saved version${undoVersions.length === 1 ? '' : 's'} available` : 'No earlier saved version in this session'; redoSaveButton.title = redoVersions.length ? `${redoVersions.length} newer saved version${redoVersions.length === 1 ? '' : 's'} available` : 'No newer saved version in this session'; overwriteButton.title = !access.capabilities.writeContent ? 'Permissions do not allow this file to be overwritten.' : '';
+    if (saving) setStatus('saving', savingReason === 'auto' ? 'Autosaving…' : savingReason === 'overwrite' ? 'Overwriting…' : savingReason === 'undo' ? 'Restoring earlier saved version…' : savingReason === 'redo' ? 'Restoring newer saved version…' : savingReason === 'close' ? 'Saving before close…' : 'Saving…');
     else if (diskError) setStatus('unavailable', 'Disk version unavailable');
     else if (incoming) setStatus('conflict', access.capabilities.writeContent ? 'Disk changed · edits preserved' : 'Disk changed · read-only edits preserved');
     else if (!access.capabilities.writeContent) setStatus('readonly', state.textDirty ? `Read-only · unsaved edits preserved · ${access.permissions.mode}` : `Read-only · ${access.permissions.mode}`);
-    else if (state.textDirty) setStatus('dirty', 'Unsaved changes');
+    else if (saveError) setStatus('unavailable', saveError);
+    else if (state.textDirty) setStatus('dirty', 'Autosave pending');
     else setStatus(live ? 'live' : 'polling', live ? 'Watching disk for agent changes' : 'Polling disk every 3 seconds');
   };
   const showTransientStatus = (kind: string, message: string) => { window.clearTimeout(statusTimer); setStatus(kind, message); statusTimer = window.setTimeout(renderTextState, 2_000); };
   const updateFileMetadata = (loaded: Omit<TextSnapshot, 'content'>) => { file.size = loaded.size; file.modified = loaded.modified; if (state.selected?.path === file.path) state.selected = { ...state.selected, size: loaded.size, modified: loaded.modified }; state.catalogDirty = true; };
+  const scheduleAutosave = () => {
+    window.clearTimeout(autosaveTimer); if (!valid() || !initialized || !state.textDirty || incoming || diskError || !access.capabilities.writeContent || closing) return;
+    const delay = Math.max(0, autosaveDelay - (Date.now() - lastChangeAt)); autosaveTimer = window.setTimeout(() => void save('auto'), delay);
+  };
   const reconcileDiskSnapshot = (loaded: TextSnapshot, announce = true) => {
     if (!editor || !valid()) return; diskError = ''; snapshot = loaded; updateFileMetadata(loaded); const current = editor.getContent();
-    if (loaded.content === current) { baseline = loaded.content; incoming = null; state.textDirty = false; renderTextState(); return; }
+    if (loaded.content === current) { if (loaded.content !== baseline) clearSavedVersions(); baseline = loaded.content; incoming = null; saveError = ''; state.textDirty = false; renderTextState(); return; }
     if (loaded.content === baseline) { incoming = null; state.textDirty = current !== baseline; renderTextState(); return; }
-    if (!state.textDirty) { baseline = loaded.content; incoming = null; editor.replaceContent(loaded.content, { preserveView: true }); state.textDirty = false; renderTextState(); if (announce) showTransientStatus('updated', 'Updated from disk'); return; }
-    incoming = loaded; renderTextState();
+    if (!state.textDirty) { baseline = loaded.content; incoming = null; saveError = ''; clearSavedVersions(); editor.replaceContent(loaded.content, { preserveView: true }); state.textDirty = false; renderTextState(); if (announce) showTransientStatus('updated', 'Updated from disk'); return; }
+    incoming = loaded; window.clearTimeout(autosaveTimer); renderTextState();
   };
   const updateDirtyState = (content: string) => {
-    window.clearTimeout(statusTimer);
-    if (incoming && content === incoming.content) { snapshot = incoming; baseline = incoming.content; incoming = null; diskError = ''; state.textDirty = false; updateFileMetadata(snapshot); }
+    window.clearTimeout(statusTimer); saveError = ''; lastChangeAt = Date.now(); redoVersions.length = 0;
+    if (incoming && content === incoming.content) { snapshot = incoming; baseline = incoming.content; incoming = null; diskError = ''; clearSavedVersions(); state.textDirty = false; updateFileMetadata(snapshot); }
     else state.textDirty = content !== baseline;
-    renderTextState();
+    renderTextState(); scheduleAutosave();
   };
   const scheduleDiskRefresh = (delay = 100) => {
     if (!valid()) return; window.clearTimeout(refreshTimer);
@@ -381,22 +394,59 @@ async function renderTextEditor(file: CatalogFile, media: HTMLElement): Promise<
     }
   };
   const loadSnapshot = async (announce = false) => {
-    const version = ++requestVersion; const loaded = await api<TextSnapshot>('/api/text?path=' + encodeURIComponent(file.path)); if (version !== requestVersion || !valid()) return; snapshot = loaded; baseline = loaded.content; incoming = null; diskError = ''; if (editor) editor.replaceContent(loaded.content, { preserveView: announce }); state.textDirty = false; updateFileMetadata(loaded); renderTextState(); if (announce) showTransientStatus('updated', 'Reloaded from disk');
+    window.clearTimeout(autosaveTimer); const version = ++requestVersion; const loaded = await api<TextSnapshot>('/api/text?path=' + encodeURIComponent(file.path)); if (version !== requestVersion || !valid()) return; snapshot = loaded; baseline = loaded.content; incoming = null; diskError = ''; saveError = ''; clearSavedVersions(); if (editor) editor.replaceContent(loaded.content, { preserveView: announce }); state.textDirty = false; updateFileMetadata(loaded); renderTextState(); if (announce) showTransientStatus('updated', 'Reloaded from disk');
   };
-  const save = async (force = false) => {
-    if (!editor || saving || !access.capabilities.writeContent || (!state.textDirty && !force) || (incoming && !force) || (diskError && !force)) return; saving = true; window.clearTimeout(statusTimer); renderTextState(); if (force) setStatus('saving', 'Overwriting…'); const content = editor.getContent(); const version = ++requestVersion; let completionStatus: { kind: string; message: string } | null = null;
-    try { const result = await api<Omit<TextSnapshot, 'content'>>('/api/text', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: file.path, content, expectedSize: snapshot.size, expectedModified: snapshot.modified, force }) }); if (version !== requestVersion || !valid()) return; baseline = content; snapshot = { content, ...result }; incoming = null; diskError = ''; updateFileMetadata(result); state.textDirty = false; completionStatus = { kind: 'updated', message: 'Saved' }; toast('Text saved.'); }
-    catch (error) { if (version !== requestVersion || !valid()) return; if (error instanceof ApiError && error.status === 409) { completionStatus = { kind: 'conflict', message: 'Save conflict · checking disk…' }; refreshPending = true; } else { completionStatus = { kind: 'unavailable', message: 'Save failed' }; toast(error instanceof Error ? error.message : String(error)); } }
-    finally { saving = false; renderTextState(); if (completionStatus && valid()) showTransientStatus(completionStatus.kind, completionStatus.message); if (refreshPending && valid()) { refreshPending = false; scheduleDiskRefresh(0); } }
+  async function performSave(reason: SaveReason, content: string, force: boolean, historyMove: 'undo' | 'redo' | null): Promise<SaveOutcome> {
+    if (!editor) return 'failed'; saving = true; savingReason = reason; saveError = ''; window.clearTimeout(autosaveTimer); window.clearTimeout(statusTimer); renderTextState(); const previousDiskContent = incoming?.content ?? baseline; const version = ++requestVersion; let succeeded = false;
+    try {
+      const result = await api<Omit<TextSnapshot, 'content'>>('/api/text', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: file.path, content, expectedSize: snapshot.size, expectedModified: snapshot.modified, force }) }); if (version !== requestVersion || !valid()) return 'failed';
+      if (historyMove === 'undo') { undoVersions.pop(); pushVersion(redoVersions, previousDiskContent); editor.replaceContent(content, { preserveView: true }); }
+      else if (historyMove === 'redo') { redoVersions.pop(); pushVersion(undoVersions, previousDiskContent); editor.replaceContent(content, { preserveView: true }); }
+      else { pushVersion(undoVersions, previousDiskContent); redoVersions.length = 0; }
+      baseline = content; snapshot = { content, ...result }; incoming = null; diskError = ''; updateFileMetadata(result); state.textDirty = editor.getContent() !== baseline;
+      if (state.textDirty) scheduleAutosave();
+      succeeded = true; if (reason === 'manual' || reason === 'overwrite') toast('Text saved.');
+      return 'saved';
+    } catch (error) {
+      if (version !== requestVersion || !valid()) return 'failed';
+      if (error instanceof ApiError && error.status === 409) { refreshPending = true; showTransientStatus('conflict', 'Save conflict · checking disk…'); }
+      else { saveError = `${reason === 'auto' ? 'Autosave' : 'Save'} failed · edits retained`; if (reason !== 'auto') toast(error instanceof Error ? error.message : String(error)); }
+      return 'failed';
+    } finally {
+      saving = false; savingReason = null; renderTextState();
+      if (succeeded && version === requestVersion && valid() && !state.textDirty) showTransientStatus('updated', reason === 'auto' ? 'Autosaved' : historyMove ? 'Saved version restored' : 'Saved');
+      if (refreshPending && valid()) { refreshPending = false; scheduleDiskRefresh(0); }
+    }
+  }
+  async function save(reason: SaveReason, force = false, requestedContent?: string, historyMove: 'undo' | 'redo' | null = null): Promise<SaveOutcome> {
+    if (activeSave) { await activeSave; if (!valid()) return 'failed'; return save(reason, force, requestedContent, historyMove); }
+    if (!editor || !valid()) return 'failed'; const content = requestedContent ?? editor.getContent();
+    if (!access.capabilities.writeContent || (incoming && !force) || (diskError && !force)) return 'blocked';
+    if (content === baseline && !force) return 'clean';
+    const operation = performSave(reason, content, force, historyMove); activeSave = operation;
+    try { return await operation; } finally { if (activeSave === operation) activeSave = null; }
+  }
+  const restoreSavedVersion = async (direction: 'undo' | 'redo') => {
+    if (!editor || state.textDirty || saving || closing || incoming || diskError || !access.capabilities.writeContent) return; const versions = direction === 'undo' ? undoVersions : redoVersions; const content = versions.at(-1); if (content === undefined) return;
+    editor.setReadOnly(true); renderTextState(); try { await save(direction, false, content, direction); } finally { if (valid()) editor.setReadOnly(closing || !access.capabilities.writeContent); }
   };
-  activeTextRefresh = () => scheduleDiskRefresh(); activeTextSetConnectionState = (connected) => { live = connected; renderTextState(); }; activeTextSetAccess = (nextAccess) => { access = nextAccess; editor?.setReadOnly(!access.capabilities.writeContent); renderTextState(); };
+  activeTextRefresh = () => scheduleDiskRefresh(); activeTextSetConnectionState = (connected) => { live = connected; renderTextState(); }; activeTextSetAccess = (nextAccess) => { access = nextAccess; editor?.setReadOnly(closing || !access.capabilities.writeContent); renderTextState(); scheduleAutosave(); };
+  activeTextFlushForClose = async () => {
+    if (!editor || !valid() || !state.textDirty) return true;
+    if (!access.capabilities.writeContent || incoming || diskError) { toast('Resolve the unsaved text state before closing.'); return false; }
+    closing = true; editor.setReadOnly(true); renderTextState(); const outcome = await save('close'); const ready = valid() && outcome !== 'failed' && outcome !== 'blocked' && !state.textDirty;
+    if (!ready && valid()) { closing = false; editor.setReadOnly(!access.capabilities.writeContent); renderTextState(); }
+    return ready;
+  };
   try {
-    const version = ++requestVersion; snapshot = await api<TextSnapshot>('/api/text?path=' + encodeURIComponent(file.path)); if (version !== requestVersion || !valid()) return; baseline = snapshot.content; updateFileMetadata(snapshot); const module = await import('./text-editor'); if (!valid()) return; editor = await module.createIntegratedTextEditor({ container: find('#text-editor-mount'), content: snapshot.content, fileName: restoredName(file.name), filePath: file.path, mime: file.mime, readOnly: !access.capabilities.writeContent, onChange: updateDirtyState, onSave: () => void save(), onMessage: toast }); if (!valid()) { editor.destroy(); return; } activeTextEditor = editor; initialized = true; renderTextState(); saveButton.addEventListener('click', () => void save()); reloadButton.addEventListener('click', () => { if (state.textDirty && !window.confirm('Discard browser edits and reload the latest disk version?')) return; void loadSnapshot(true).catch((error) => { diskError = error instanceof Error ? error.message : String(error); renderTextState(); }); }); overwriteButton.addEventListener('click', () => void save(true)); scheduleDiskRefresh(0);
-  } catch (error) { if (valid()) { activeTextRefresh = null; activeTextSetConnectionState = null; activeTextSetAccess = null; media.innerHTML = `<p class="viewer-error">${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`; } }
+    const version = ++requestVersion; snapshot = await api<TextSnapshot>('/api/text?path=' + encodeURIComponent(file.path)); if (version !== requestVersion || !valid()) return; baseline = snapshot.content; updateFileMetadata(snapshot); const module = await import('./text-editor'); if (!valid()) return; editor = await module.createIntegratedTextEditor({ container: find('#text-editor-mount'), content: snapshot.content, fileName: restoredName(file.name), filePath: file.path, mime: file.mime, readOnly: !access.capabilities.writeContent, onChange: updateDirtyState, onSave: () => void save('manual'), onMessage: toast }); if (!valid()) { editor.destroy(); return; } activeTextEditor = editor; initialized = true; renderTextState(); saveButton.addEventListener('click', () => void save('manual')); undoSaveButton.addEventListener('click', () => void restoreSavedVersion('undo')); redoSaveButton.addEventListener('click', () => void restoreSavedVersion('redo')); reloadButton.addEventListener('click', () => { if (state.textDirty && !window.confirm('Discard browser edits and reload the latest disk version?')) return; void loadSnapshot(true).catch((error) => { diskError = error instanceof Error ? error.message : String(error); renderTextState(); }); }); overwriteButton.addEventListener('click', () => void save('overwrite', true)); scheduleDiskRefresh(0);
+  } catch (error) { if (valid()) { activeTextRefresh = null; activeTextSetConnectionState = null; activeTextSetAccess = null; activeTextFlushForClose = null; media.innerHTML = `<p class="viewer-error">${escapeHtml(error instanceof Error ? error.message : String(error))}</p>`; } }
 }
 async function openViewer(file: CatalogFile): Promise<void> {
+  if (state.screen === 'viewer' && state.selected?.path === file.path) { activeTextEditor?.focus(); return; }
+  if (state.screen === 'viewer' && !await closeViewer()) return;
   stopPreviewVideo(); disposeActiveViewer(); find<HTMLElement>('.app-shell').classList.remove('preview-visible'); state.selected = file; state.screen = 'viewer'; state.textDirty = false; find('#catalog-view').setAttribute('hidden', ''); find('#viewer').removeAttribute('hidden'); find('#search-wrap').setAttribute('hidden', ''); find('#location-name').textContent = restoredName(file.name); const viewer = find<HTMLElement>('#viewer'); viewer.innerHTML = `<div class="viewer-head"><button class="back-button" id="back-button">← Back to files</button><div><h1>${escapeHtml(restoredName(file.name))}</h1><p>${escapeHtml(file.mime)} · ${formatSize(file.size)} · ${formatModified(file.modified)}</p><span id="viewer-permission">${lockMarkup(file.access)}</span></div><button class="restore-button viewer-download" id="restore-button"${file.access.capabilities.open ? '' : ' disabled'}>Download <span>↓</span></button></div><div class="viewer-media" id="viewer-media"></div>`;
-  find('#back-button').addEventListener('click', closeViewer); find('#restore-button').addEventListener('click', () => { if (file.access.capabilities.open) void downloadSelected(); }); const media = find<HTMLElement>('#viewer-media'); startViewerPermissionUpdates(file);
+  find('#back-button').addEventListener('click', () => void closeViewer()); find('#restore-button').addEventListener('click', () => { if (file.access.capabilities.open) void downloadSelected(); }); const media = find<HTMLElement>('#viewer-media'); startViewerPermissionUpdates(file);
   if (!file.access.capabilities.open) media.innerHTML = '<p class="viewer-error">This file cannot be read with the current permissions.</p>';
   else if (file.editableText) void renderTextEditor(file, media);
   else if (file.kind === 'images') { const image = new Image(); image.src = mediaUrl(file); image.alt = `Preview of ${restoredName(file.name)}`; image.className = 'viewer-image'; media.append(image); }
@@ -404,7 +454,7 @@ async function openViewer(file: CatalogFile): Promise<void> {
   else if (file.kind === 'videos') renderNativeVideo(file);
   else media.innerHTML = '<p class="viewer-error">This file cannot be previewed.</p>';
 }
-function closeViewer(): void { if (state.textDirty && !window.confirm('Discard unsaved text changes?')) return; const refreshNeeded = state.catalogDirty; state.catalogDirty = false; state.textDirty = false; disposeActiveViewer(); state.screen = 'catalog'; state.selected = null; find('#viewer').setAttribute('hidden', ''); find('#catalog-view').removeAttribute('hidden'); find('#search-wrap').removeAttribute('hidden'); find('#location-name').textContent = state.directory || 'Root'; renderCatalog(); if (refreshNeeded) scheduleCatalogRefresh(0); }
+async function closeViewer(): Promise<boolean> { if (state.textDirty) { if (activeTextFlushForClose) { if (!await activeTextFlushForClose()) return false; } else if (!window.confirm('Discard unsaved text changes?')) return false; } const refreshNeeded = state.catalogDirty; state.catalogDirty = false; state.textDirty = false; disposeActiveViewer(); state.screen = 'catalog'; state.selected = null; find('#viewer').setAttribute('hidden', ''); find('#catalog-view').removeAttribute('hidden'); find('#search-wrap').removeAttribute('hidden'); find('#location-name').textContent = state.directory || 'Root'; renderCatalog(); if (refreshNeeded) scheduleCatalogRefresh(0); return true; }
 async function downloadSelected(): Promise<void> { if (!state.selected) return; const response = await fetch(mediaUrl(state.selected)); if (!response.ok) return toast('Could not download this file.'); const blob = await response.blob(); const href = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = href; link.download = restoredName(state.selected.name); link.click(); window.setTimeout(() => URL.revokeObjectURL(href), 1_000); }
 type CatalogResponse = { root: string; directory: string; parentListable: boolean; files: CatalogEntry[]; hasMore: boolean; total: number | null; frameTimeRange: FrameTimeRange | null; directoryAccess: EntryAccess; parentAccess: EntryAccess | null; cacheWritable: boolean };
 function catalogRoute(): string { return `/api/catalog?path=${encodeURIComponent(state.directory)}&hidden=${state.showHidden ? '1' : '0'}&query=${encodeURIComponent(state.query)}&offset=${state.page * 250}`; }
@@ -418,7 +468,7 @@ function applyCatalog(result: CatalogResponse, reconcileSelection = false): void
   }
   if (state.screen === 'catalog') { renderCatalog(); if (state.previewVisible && state.selected) showPreview(state.selected); }
 }
-async function openFolder(path: string): Promise<void> { state.page = 0; const result = await api<CatalogResponse>('/api/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path, showHidden: state.showHidden, query: state.query }) }); state.root = result.root; state.selected = null; state.selectedPaths.clear(); state.selectionAnchor = ''; state.catalogDirty = false; applyCatalog(result); closeViewer(); subscribeToDirectory(); }
+async function openFolder(path: string): Promise<void> { if (state.screen === 'viewer' && !await closeViewer()) return; state.page = 0; const result = await api<CatalogResponse>('/api/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path, showHidden: state.showHidden, query: state.query }) }); state.root = result.root; state.selected = null; state.selectedPaths.clear(); state.selectionAnchor = ''; state.catalogDirty = false; applyCatalog(result); subscribeToDirectory(); }
 async function navigateDirectory(path: string): Promise<void> { state.directory = path; state.page = 0; state.query = ''; state.selected = null; state.selectedPaths.clear(); state.selectionAnchor = ''; find<HTMLInputElement>('#search').value = ''; const result = await api<CatalogResponse>(catalogRoute()); applyCatalog(result); subscribeToDirectory(); }
 async function refreshCatalog(reconcileSelection = false): Promise<void> {
   if (!state.root) return;
