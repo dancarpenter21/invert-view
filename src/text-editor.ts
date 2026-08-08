@@ -1,4 +1,7 @@
 import { Compartment, EditorSelection, EditorState, type Extension } from '@codemirror/state';
+import { syntaxTree } from '@codemirror/language';
+import { hoverTooltip } from '@codemirror/view';
+import type { SyntaxNode } from '@lezer/common';
 import { basicSetup, EditorView } from 'codemirror';
 
 export type IntegratedTextEditor = {
@@ -38,6 +41,38 @@ function markdownImageUrl(documentPath: string, reference: string): string | nul
   return `/api/media?path=${encodeURIComponent(path)}`;
 }
 
+function markdownLinkAt(view: EditorView, position: number, side: -1 | 1): { from: number; to: number; reference: string } | null {
+  let node: SyntaxNode | null = syntaxTree(view.state).resolveInner(position, side);
+  while (node && node.name !== 'Link' && node.name !== 'Image') node = node.parent;
+  if (!node || node.name !== 'Link') return null;
+  const url = node.getChild('URL');
+  if (!url) return null;
+  let reference = view.state.sliceDoc(url.from, url.to);
+  if (reference.startsWith('<') && reference.endsWith('>')) reference = reference.slice(1, -1);
+  reference = reference.replace(/\\([!"#$%&'()*+,./:;<=>?@[\\\]^_`{|}~-])/g, '$1');
+  return { from: node.from, to: node.to, reference };
+}
+
+function markdownImageHover(documentPath: string): Extension {
+  return hoverTooltip(async (view, position, side) => {
+    const link = markdownLinkAt(view, position, side); if (!link || link.reference.startsWith('//') || /^[a-z][a-z\d+.-]*:/i.test(link.reference)) return null;
+    let referencedPath: string; try { referencedPath = decodeURIComponent(link.reference.split(/[?#]/, 1)[0]); } catch { return null; }
+    if (!/\.inv$/i.test(referencedPath)) return null;
+    const source = markdownImageUrl(documentPath, link.reference); if (!source) return null;
+    const image = await new Promise<HTMLImageElement | null>((resolve) => { const candidate = new Image(); candidate.onload = () => resolve(candidate); candidate.onerror = () => resolve(null); candidate.src = source; });
+    if (!image) return null;
+    image.alt = `Preview of ${link.reference}`;
+    return {
+      pos: link.from, end: link.to, above: true,
+      create: () => {
+        const dom = document.createElement('div'); dom.className = 'cm-markdown-image-preview';
+        dom.append(image);
+        return { dom };
+      },
+    };
+  }, { hoverTime: 250, hideOnChange: true });
+}
+
 async function languageFor(fileName: string, mime: string): Promise<Extension[]> {
   const extension = extensionFor(fileName);
   if (mime === 'text/markdown' || extension === 'md') return [(await import('@codemirror/lang-markdown')).markdown()];
@@ -70,7 +105,7 @@ export async function createIntegratedTextEditor(options: EditorOptions): Promis
   const root = options.container.querySelector<HTMLElement>('.integrated-editor'); const host = options.container.querySelector<HTMLElement>('.code-editor-host'); if (!root || !host) throw new Error('The integrated editor could not be created.');
   let replacing = false; let previewTimer: number | undefined; let previewActive = false; let previewVersion = 0; const readOnly = new Compartment();
   const readOnlyExtensions = (value: boolean) => [EditorState.readOnly.of(value), EditorView.editable.of(!value)];
-  const view = new EditorView({ parent: host, doc: options.content, extensions: [basicSetup, editorTheme, readOnly.of(readOnlyExtensions(Boolean(options.readOnly))), EditorView.contentAttributes.of({ 'aria-label': `Editor for ${options.fileName}`, spellcheck: 'false' }), ...(await languageFor(options.fileName, options.mime)), EditorView.updateListener.of((update) => { if (!update.docChanged || replacing) return; const content = update.state.doc.toString(); options.onChange(content); if (previewActive) { window.clearTimeout(previewTimer); previewTimer = window.setTimeout(() => void renderPreview(), 150); } })] });
+  const view = new EditorView({ parent: host, doc: options.content, extensions: [basicSetup, editorTheme, readOnly.of(readOnlyExtensions(Boolean(options.readOnly))), EditorView.contentAttributes.of({ 'aria-label': `Editor for ${options.fileName}`, spellcheck: 'false' }), ...(await languageFor(options.fileName, options.mime)), ...(markdown ? [markdownImageHover(options.filePath)] : []), EditorView.updateListener.of((update) => { if (!update.docChanged || replacing) return; const content = update.state.doc.toString(); options.onChange(content); if (previewActive) { window.clearTimeout(previewTimer); previewTimer = window.setTimeout(() => void renderPreview(), 150); } })] });
 
   async function renderPreview(): Promise<void> {
     const preview = options.container.querySelector<HTMLElement>('.markdown-preview'); if (!preview) return; const version = ++previewVersion; preview.setAttribute('aria-busy', 'true');

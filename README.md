@@ -191,6 +191,8 @@ actions instead.
 Markdown files add **Editor** and **Preview** tabs. Preview renders the current
 unsaved buffer as sanitized GitHub-style Markdown; the rendered view is
 read-only and embedded HTML cannot execute scripts or event handlers. The
+Editor tab previews a relative link ending in `.inv` when the link points to an
+inverted image and is hovered.
 editor accepts files up to 5 MB. Saving bytewise-inverts the updated UTF-8 text
 and atomically replaces the selected `.inv` source file.
 
